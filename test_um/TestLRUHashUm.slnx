@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="TestLRUHashUm.vcxproj" Id="505a126a-9b9a-41eb-b3fe-3637f3f5bc62" />
+</Solution>

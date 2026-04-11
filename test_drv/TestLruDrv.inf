@@ -1,0 +1,54 @@
+; TestLruDrv.inf
+; INF file for LRU Hash Table test kernel-mode driver
+
+[Version]
+Signature           = "$WINDOWS NT$"
+Class               = System
+ClassGuid           = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider            = %ManufacturerName%
+DriverVer           = 03/11/2026,1.0.0.0
+CatalogFile         = TestLruDrv.cat
+PnpLockdown         = 1
+
+[DestinationDirs]
+TestLruDrv_CopyFiles  = 12 ; %SystemRoot%\System32\drivers
+
+[SourceDisksNames]
+1                   = %DiskName%,,,
+
+[SourceDisksFiles]
+TestLruDrv.sys        = 1
+
+[Manufacturer]
+%ManufacturerName%  = TestLruDrv_Manufacturer, NTx86, NTamd64, NTarm64
+
+[TestLruDrv_Manufacturer.NTx86]
+%TestLruDrv_DeviceDesc% = TestLruDrv_Install, Root\TestLruDrv
+
+[TestLruDrv_Manufacturer.NTamd64]
+%TestLruDrv_DeviceDesc% = TestLruDrv_Install, Root\TestLruDrv
+
+[TestLruDrv_Manufacturer.NTarm64]
+%TestLruDrv_DeviceDesc% = TestLruDrv_Install, Root\TestLruDrv
+
+[TestLruDrv_Install]
+CopyFiles           = TestLruDrv_CopyFiles
+
+[TestLruDrv_Install.Services]
+AddService          = TestLruDrv, 0x00000002, TestLruDrv_Service_Install
+
+[TestLruDrv_CopyFiles]
+TestLruDrv.sys
+
+[TestLruDrv_Service_Install]
+DisplayName         = %TestLruDrv_ServiceName%
+ServiceType         = 1 ; SERVICE_KERNEL_DRIVER
+StartType           = 3 ; SERVICE_DEMAND_START
+ErrorControl        = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary       = %12%\TestLruDrv.sys
+
+[Strings]
+ManufacturerName       = "AD"
+TestLruDrv_DeviceDesc  = "LRU Hash Table test Driver"
+TestLruDrv_ServiceName = "TestLruDrv"
+DiskName               = "LRU Hash Table test Driver Installation Disk"

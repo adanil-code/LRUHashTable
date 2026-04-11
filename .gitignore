@@ -1,0 +1,59 @@
+# Windows system files
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+ehthumbs.db
+
+# Windows hidden files
+.DS_Store
+*.lnk
+
+# User-specific files
+*.log
+*.tmp
+*.bak
+
+# Build outputs (common in Visual Studio, C++, or other compilers)
+bin/
+obj/
+Debug/
+Release/
+*.exe
+*.dll
+*.pdb
+
+# Python (if used on Windows)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node.js (if you ever use JavaScript projects)
+node_modules/
+
+# IDE / Editor files
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# JetBrains IDEs (PyCharm, WebStorm, etc.)
+.idea/
+*.iml
+
+# Logs and temporary files
+*.log
+*.swp
+*.swo
+
+# Backup and cache files
+bak/
+*.bak
+*.tmp
+*.old
+*.orig
+
+# Git itself
+.git/
