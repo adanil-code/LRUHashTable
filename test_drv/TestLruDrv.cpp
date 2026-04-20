@@ -6,7 +6,7 @@
 * you may not use this file except in compliance with the License.
 * You may obtain a copy of the License at:
 *
-* http://www.apache.org/licenses/LICENSE-2.0
+*     http://www.apache.org/licenses/LICENSE-2.0
 *
 * This software is provided on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS
 * OF ANY KIND, either express or implied.
@@ -73,19 +73,6 @@ void* __cdecl operator new(_In_ SIZE_T     uSize,
     return ExAllocatePool2(ullPoolFlags, uSize, ulTag);
 }
 
-void __cdecl operator delete(_In_opt_ void* pMemory,
-                             _In_     POOL_FLAGS ullPoolFlags,
-                             _In_     ULONG      ulTag)
-{
-    UNREFERENCED_PARAMETER(ullPoolFlags);
-    UNREFERENCED_PARAMETER(ulTag);
-
-    if (pMemory)
-    {
-        ExFreePoolWithTag(pMemory, ulTag);
-    }
-}
-
 void* __cdecl operator new[](_In_ SIZE_T     uSize,
                              _In_ POOL_FLAGS ullPoolFlags,
                              _In_ ULONG      ulTag) noexcept
@@ -93,35 +80,22 @@ void* __cdecl operator new[](_In_ SIZE_T     uSize,
     return ExAllocatePool2(ullPoolFlags, uSize, ulTag);
 }
 
-void __cdecl operator delete[](_In_opt_ void*      pMemory,
-                               _In_     POOL_FLAGS ullPoolFlags,
-                               _In_     ULONG      ulTag)
-{
-    UNREFERENCED_PARAMETER(ullPoolFlags);
-    UNREFERENCED_PARAMETER(ulTag);
-
-    if (pMemory)
-    {
-        ExFreePoolWithTag(pMemory, ulTag);
-    }
-}
-
 void __cdecl operator delete(_In_opt_ void* pMemory)
 {
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
-void __cdecl operator delete(_In_opt_ void*  pMemory,
+void __cdecl operator delete(_In_opt_ void* pMemory,
                              _In_     SIZE_T uSize)
 {
     UNREFERENCED_PARAMETER(uSize);
 
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
@@ -129,18 +103,18 @@ void __cdecl operator delete[](_In_opt_ void* pMemory)
 {
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
-void __cdecl operator delete[](_In_opt_ void*  pMemory,
+void __cdecl operator delete[](_In_opt_ void* pMemory,
                                _In_     SIZE_T uSize)
 {
     UNREFERENCED_PARAMETER(uSize);
 
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
@@ -281,8 +255,8 @@ struct PerformanceMetrics
 // ----------------------------------------------------------------------------
 // Thread Management Utilities
 // ----------------------------------------------------------------------------
-// Increased from MAXIMUM_WAIT_OBJECTS (64) to allow massive oversubscription
-#define MAX_TEST_THREADS 256 
+// Increased to allow massive oversubscription on >64 core systems
+#define MAX_TEST_THREADS 2048 
 
 struct TEST_WORKER_CONTEXT
 {
@@ -345,8 +319,7 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
                                                  (PVOID*)&pMgr->pThreads[ulIndex],
                                                  NULL);
             if (NT_SUCCESS(ntStatus))
-            {
-                // Standard Priority for Fair Time-Slicing
+            {                
                 KeSetPriorityThread((PKTHREAD)pMgr->pThreads[ulIndex], 15);
             }
             else
@@ -466,13 +439,33 @@ VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
     }
 }
 
+VOID SetWorkerThreadAffinity(_In_ ULONG ulThreadId)
+{
+    ULONG ulTotalProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    if (ulTotalProcessors == 0)
+    {
+        ulTotalProcessors = 1;
+    }
+
+    PROCESSOR_NUMBER procNum;
+    if (NT_SUCCESS(KeGetProcessorNumberFromIndex(ulThreadId % ulTotalProcessors, &procNum)))
+    {
+        GROUP_AFFINITY affinity = { 0 };
+        affinity.Group = procNum.Group;
+        affinity.Mask  = (KAFFINITY)-1; // Allow execution on any core within this group
+        
+        // Correctly set the group affinity for the CURRENT thread
+        KeSetSystemGroupAffinityThread(&affinity, NULL);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Custom C++ templated Kernel QuickSort Implementation
 // ----------------------------------------------------------------------------
 template<typename T, typename Compare>
 void QuickSort(_Inout_updates_(uCount) T* pBase,
-    _In_                       SIZE_T  uCount,
-    _In_                       Compare Comp)
+               _In_                       SIZE_T  uCount,
+               _In_                       Compare Comp)
 {
     if (pBase == nullptr || uCount <= 1)
     {
@@ -978,6 +971,8 @@ VOID EvictionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
 
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
+
     EvictionExhaustionCtx* pEvictionCtx = (EvictionExhaustionCtx*)pCtx->pUserContext;
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
@@ -1054,7 +1049,7 @@ BOOLEAN RunEvictionAndExhaustionTest()
 
 struct MtCorrectnessCtx
 {
-    TestTable*    pTable;
+    TestTable* pTable;
     SIZE_T        uCacheCapacity;
     UINT64        ullKeySpace;
     volatile LONG lDataCorruption;
@@ -1063,6 +1058,8 @@ struct MtCorrectnessCtx
 VOID MtCorrectnessWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
+
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
 
     MtCorrectnessCtx* pMtCtx = (MtCorrectnessCtx*)pCtx->pUserContext;
     FastRng Rng(pCtx->ulThreadId + 9999);
@@ -1146,9 +1143,9 @@ BOOLEAN RunMultiThreadedCorrectnessTest()
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAXIMUM_WAIT_OBJECTS)
+    if (ulThreadCount > MAX_TEST_THREADS)
     {
-        ulThreadCount = MAXIMUM_WAIT_OBJECTS;
+        ulThreadCount = MAX_TEST_THREADS;
     }
 
     MtCorrectnessCtx Ctx = { 0 };
@@ -1353,7 +1350,7 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
 
 struct ContentionCtx
 {
-    TestTable*      pTable;
+    TestTable* pTable;
     volatile LONG64 llTotalOps;
     volatile LONG64 llTotalTrimmed;
     SIZE_T          uCacheCapacity;
@@ -1364,6 +1361,8 @@ struct ContentionCtx
 VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
+
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
 
     ContentionCtx* pContentionCtx = (ContentionCtx*)pCtx->pUserContext;
     FastRng Rng(pCtx->ulThreadId + 1000);
@@ -1458,6 +1457,8 @@ VOID ContentionTrimmer(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
 
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
+
     ContentionCtx* pContentionCtx = (ContentionCtx*)pCtx->pUserContext;
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
@@ -1539,9 +1540,9 @@ BOOLEAN RunContentionTest_NoEviction(_In_ int nSecondsToRun)
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAXIMUM_WAIT_OBJECTS)
+    if (ulThreadCount > MAX_TEST_THREADS)
     {
-        ulThreadCount = MAXIMUM_WAIT_OBJECTS;
+        ulThreadCount = MAX_TEST_THREADS;
     }
 
     LARGE_INTEGER liFreq, liStart, liEnd;
@@ -1625,9 +1626,9 @@ BOOLEAN RunContentionTest_EvictionThrashing(_In_ int nSecondsToRun)
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAXIMUM_WAIT_OBJECTS)
+    if (ulThreadCount > MAX_TEST_THREADS)
     {
-        ulThreadCount = MAXIMUM_WAIT_OBJECTS;
+        ulThreadCount = MAX_TEST_THREADS;
     }
 
     LARGE_INTEGER liFreq, liStart, liEnd;
@@ -1732,9 +1733,9 @@ UINT64 RunContentionTest_MixedWorkload(_In_ int    nSecondsToRun,
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAXIMUM_WAIT_OBJECTS)
+    if (ulThreadCount > MAX_TEST_THREADS)
     {
-        ulThreadCount = MAXIMUM_WAIT_OBJECTS;
+        ulThreadCount = MAX_TEST_THREADS;
     }
 
     LARGE_INTEGER liFreq, liStart, liEnd;
@@ -1842,9 +1843,9 @@ UINT64 RunContentionTest_ReadHeavySkewed(_In_ int    nSecondsToRun,
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAXIMUM_WAIT_OBJECTS)
+    if (ulThreadCount > MAX_TEST_THREADS)
     {
-        ulThreadCount = MAXIMUM_WAIT_OBJECTS;
+        ulThreadCount = MAX_TEST_THREADS;
     }
 
     LARGE_INTEGER liFreq, liStart, liEnd;
@@ -2233,7 +2234,7 @@ BOOLEAN RunEnumerateTest(_In_ SIZE_T uCacheCapacity)
 
 struct ScalingCtx
 {
-    TestTable*      pTable;
+    TestTable* pTable;
     volatile LONG64 llTotalOps;
     SIZE_T          uCacheCapacity;
     volatile LONG   lWarmUpFlag;
@@ -2242,6 +2243,8 @@ struct ScalingCtx
 VOID ScalingWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
+
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
 
     ScalingCtx* pScalingCtx = (ScalingCtx*)pCtx->pUserContext;
     FastRng Rng(pCtx->ulThreadId + 5000);
@@ -2332,9 +2335,9 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
         ulMaxThreads = 4;
     }
 
-    if (ulMaxThreads > MAXIMUM_WAIT_OBJECTS)
+    if (ulMaxThreads > MAX_TEST_THREADS)
     {
-        ulMaxThreads = MAXIMUM_WAIT_OBJECTS;
+        ulMaxThreads = MAX_TEST_THREADS;
     }
 
     UINT64 ullBaselineThroughput = 0;
@@ -2452,8 +2455,8 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
 
 struct TailLatencyCtx
 {
-    TestTable*    pTable;
-    UINT64*       pGlobalSamples;
+    TestTable* pTable;
+    UINT64* pGlobalSamples;
     SIZE_T        uSamplesPerThread;
     SIZE_T        uCacheCapacity;
     LARGE_INTEGER liFreq;
@@ -2463,6 +2466,8 @@ struct TailLatencyCtx
 VOID TailLatencyWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
+
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
 
     TailLatencyCtx* pTailLatencyCtx = (TailLatencyCtx*)pCtx->pUserContext;
     FastRng Rng(pCtx->ulThreadId + 8000);
@@ -2585,9 +2590,9 @@ BOOLEAN RunTailLatencyTest(_In_ SIZE_T uCacheCapacity)
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAXIMUM_WAIT_OBJECTS)
+    if (ulThreadCount > MAX_TEST_THREADS)
     {
-        ulThreadCount = MAXIMUM_WAIT_OBJECTS;
+        ulThreadCount = MAX_TEST_THREADS;
     }
 
     const SIZE_T uSamplesPerThread = 50000;
@@ -2946,13 +2951,33 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT  pDriverObject,
 
     if (NT_SUCCESS(ntStatus))
     {
-        ObReferenceObjectByHandle(hThread,
-                                  THREAD_ALL_ACCESS,
-                                  NULL,
-                                  KernelMode,
-                                  (PVOID*)&g_pMasterBenchmarkThread,
-                                  NULL);
+        NTSTATUS refStatus = ObReferenceObjectByHandle(hThread,
+                                                       THREAD_ALL_ACCESS,
+                                                       NULL,
+                                                       KernelMode,
+                                                       (PVOID*)&g_pMasterBenchmarkThread,
+                                                       NULL);
+
+        if (!NT_SUCCESS(refStatus))
+        {
+            LOG_ERR("[LRU] [!] Failed to reference master thread handle. Aborting.\n");
+            
+            // Fast abort the thread we just spawned
+            InterlockedExchange(&g_lAbortTests, 1);
+            
+            // Wait for it to safely terminate to prevent the BSOD condition
+            ZwWaitForSingleObject(hThread, FALSE, NULL);
+            ZwClose(hThread);
+            
+            return refStatus;
+        }
+
         ZwClose(hThread);
+    }
+    else
+    {
+        LOG_ERR("[LRU] [!] Failed to create master system thread.\n");
+        return ntStatus;
     }
 
     return STATUS_SUCCESS;
