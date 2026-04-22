@@ -73,6 +73,23 @@
 #endif
 
 // ----------------------------------------------------------------------------
+// Cache Line Constants
+//
+// We explicitly avoid std::hardware_destructive_interference_size due to ABI 
+// instability warnings ([-Winterference-size]) across different compiler flags.
+// 
+// Apply 128-byte alignment strictly for Apple Silicon to prevent false sharing,
+// while preserving optimal 64-byte density for x86_64 and standard Linux ARM64.
+// ----------------------------------------------------------------------------
+#if defined(__APPLE__) && defined(__aarch64__)
+    constexpr size_t CACHE_LINE_SIZE = 128;
+#else        
+    constexpr size_t CACHE_LINE_SIZE = 64;
+#endif
+
+constexpr size_t CACHE_LINE_MASK = CACHE_LINE_SIZE - 1;
+
+// ----------------------------------------------------------------------------
 // Cross-Platform Hardware Pause Macro
 // ----------------------------------------------------------------------------
 // Why we pause:
@@ -428,14 +445,14 @@ struct DefaultNumaAllocator
         }
 
         // If NUMA is completely unavailable, use standard aligned allocation
-        return ::operator new[](size, std::align_val_t{ 64 }, std::nothrow);
+        return ::operator new[](size, std::align_val_t{ CACHE_LINE_SIZE }, std::nothrow);
 #else
         // macOS / Unsupported platforms
-        return ::operator new[](size, std::align_val_t{ 64 }, std::nothrow);
+        return ::operator new[](size, std::align_val_t{ CACHE_LINE_SIZE }, std::nothrow);
 #endif
     }
 
-    static inline void Free(_In_ void*  ptr,
+    static inline void Free(_In_ void* ptr,
                             _In_ size_t size) noexcept
     {
         if (!ptr)
@@ -455,10 +472,10 @@ struct DefaultNumaAllocator
         }
         else
         {
-            ::operator delete[](ptr, std::align_val_t{ 64 });
+            ::operator delete[](ptr, std::align_val_t{ CACHE_LINE_SIZE });
         }
 #else
-        ::operator delete[](ptr, std::align_val_t{ 64 });
+        ::operator delete[](ptr, std::align_val_t{ CACHE_LINE_SIZE });
 #endif
     }
 };
@@ -565,7 +582,7 @@ public:
 
         // --------------------------------------------------------------------
         // 2. MATCH PATH: Key Verification
-        // Kept as high as possible so it remains in the same 64-byte L1 cache 
+        // Kept as high as possible so it remains in the same dynamic cache 
         // line as the hash variables above.
         // --------------------------------------------------------------------
         TKey     Key;          // Hash table key (Starts exactly at 16-byte boundary)
@@ -584,24 +601,25 @@ public:
 
     // ------------------------------------------------------------------------
     // Cache Shard
-    // Aligned to 64 bytes to prevent false sharing across CPU cache lines.
-    // If two shards share a CPU cache line, a lock acquisition on Shard A 
-    // would inadvertently invalidate the cache line for a CPU accessing Shard B.
-    // Each shard independently manages its own capacity, locks, and LRU queue.
+    // Aligned to dynamic cache line size to prevent false sharing across CPU 
+    // cache lines. If two shards share a CPU cache line, a lock acquisition 
+    // on Shard A would inadvertently invalidate the cache line for a CPU 
+    // accessing Shard B. Each shard independently manages its own capacity, 
+    // locks, and LRU queue.
     // ------------------------------------------------------------------------    
-    struct alignas(64) Shard
+    struct alignas(CACHE_LINE_SIZE) Shard
     {
         // CACHE LINE 0: The Lock. 
         // Spinning threads will blast this line, but it won't interfere 
         // with the lock-holder's data access.
-        alignas(64) SpinLock<TSpinWaitPolicy> Lock;     // Lock for synchronizing shard access
+        alignas(CACHE_LINE_SIZE) SpinLock<TSpinWaitPolicy> Lock;     // Lock for synchronizing shard access
 
         // Cache Line 1: Read-Heavy Hash Data
         // Exclusively owned by the thread that successfully acquires the lock
-        alignas(64) LruNode*  Nodes;                    // Flat array segment of pre-allocated nodes
-        uint32_t*             Buckets;                  // Array segment of hash bucket heads
+        alignas(CACHE_LINE_SIZE) LruNode* Nodes;                    // Flat array segment of pre-allocated nodes
+        uint32_t* Buckets;                  // Array segment of hash bucket heads
 
-        void*                 RawMemoryBlock;           // Base pointer for allocator deallocation
+        void* RawMemoryBlock;           // Base pointer for allocator deallocation
         size_t                AllocationSize;           // Exact size allocated on the node
 
         uint32_t              BucketMask;               // Bitwise mask used to route a hash to a specific bucket index efficiently
@@ -609,7 +627,7 @@ public:
 
         // CACHE LINE 2: Write-Heavy LRU State
         // Mutated on every Add/Overwrite MRU promotion
-        alignas(64) uint32_t  LruHead;                  // MRU pointer
+        alignas(CACHE_LINE_SIZE) uint32_t  LruHead;                  // MRU pointer
         uint32_t              LruTail;                  // LRU (Eviction Target)
         uint32_t              FreeHead;                 // Unused node stack
 
@@ -618,11 +636,11 @@ public:
 
         // CACHE LINE 3: Active Count
         // Mutated independently, lock-free statistical reads
-        alignas(64) std::atomic<uint32_t> ActiveCount;  // Tracks live items to enable O(1) capacity checks
+        alignas(CACHE_LINE_SIZE) std::atomic<uint32_t> ActiveCount;  // Tracks live items to enable O(1) capacity checks
     };    
 
 private:
-    Shard*   m_Shards;              // Dynamically allocated array representing the sharded cache architecture
+    Shard* m_Shards;              // Dynamically allocated array representing the sharded cache architecture
     uint32_t m_ShardCount;          // Total number of initialized shards. Guaranteed to be a power of 2
     uint32_t m_PromotionThreshold;  // Percentage threshold (0-100) determining how aggressively nodes are promoted to MRU
 
@@ -679,7 +697,7 @@ private:
     // Severs a node from the doubly-linked LRU list using 32-bit indices.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    inline void UnlinkLru(_In_ Shard*   ShardPtr,
+    inline void UnlinkLru(_In_ Shard* ShardPtr,
                           _In_ uint32_t Index) noexcept
     {
         uint32_t prev = ShardPtr->Nodes[Index].LruPrev;
@@ -710,7 +728,7 @@ private:
     // it as the Most Recently Used item, and updates its Generation stamp.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    inline void PushMru(_In_ Shard*   ShardPtr,
+    inline void PushMru(_In_ Shard* ShardPtr,
                         _In_ uint32_t Index) noexcept
     {
         ShardPtr->Generation++;
@@ -738,7 +756,7 @@ private:
     // Removes a node from the singly-linked hash collision chain.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    void RemoveFromHashChain(_In_ Shard*   ShardPtr,
+    void RemoveFromHashChain(_In_ Shard* ShardPtr,
                              _In_ uint32_t Index) noexcept
     {        
         uint32_t bucketIdx = static_cast<uint32_t>(ShardPtr->Nodes[Index].Hash & ShardPtr->BucketMask);
@@ -782,7 +800,7 @@ public:
     // Calculates power-of-2 shard counts based on logical processors to 
     // prevent lock contention. Allocates the Mega-Block flat arrays
     // via the custom allocator and initializes the free list. Ensures absolute 
-    // 64-byte alignment for buckets and precomputes thresholds.
+    // CACHE_LINE_SIZE alignment for buckets and precomputes thresholds.
     // ------------------------------------------------------------------------
     [[nodiscard]]
     bool Initialize(_In_ const size_t TotalEntries,
@@ -891,14 +909,14 @@ public:
                 bucketCountPerShard <<= 1;
             }
 
-            // Calculate bucket size and pad it to the nearest 64 bytes for relative alignment
+            // Calculate bucket size and pad it to the nearest dynamic cache boundary for relative alignment
             size_t bucketBytesPerShard = sizeof(uint32_t) * bucketCountPerShard;
-            bucketBytesPerShard = (bucketBytesPerShard + 63) & ~(size_t)63;
+            bucketBytesPerShard = (bucketBytesPerShard + CACHE_LINE_MASK) & ~(size_t)CACHE_LINE_MASK;
 
             size_t nodeBytesPerShard = sizeof(LruNode) * capacityPerShard;
 
-            // We allocate Buckets and Nodes in a single block per shard, +64 for manual alignment
-            size_t allocationSizePerShard = bucketBytesPerShard + nodeBytesPerShard + 64;
+            // We allocate Buckets and Nodes in a single block per shard, +CACHE_LINE_SIZE for manual alignment
+            size_t allocationSizePerShard = bucketBytesPerShard + nodeBytesPerShard + CACHE_LINE_SIZE;
 
             // To eliminate "if (threshold == 0)" branches from the Lookup hot-path, 
             // we map the percentage to a absolute generation delta
@@ -935,9 +953,9 @@ public:
                 m_Shards[i].RawMemoryBlock = rawBlock;
                 m_Shards[i].AllocationSize = allocationSizePerShard;
 
-                // Shift the raw pointer to the next absolute 64-byte boundary
+                // Shift the raw pointer to the next absolute dynamic cache boundary
                 uintptr_t uPtr = reinterpret_cast<uintptr_t>(rawBlock);
-                uPtr = (uPtr + 63) & ~(uintptr_t)63;
+                uPtr = (uPtr + CACHE_LINE_MASK) & ~(uintptr_t)CACHE_LINE_MASK;
 
                 m_Shards[i].Buckets = reinterpret_cast<uint32_t*>(uPtr);
                 m_Shards[i].Nodes = reinterpret_cast<LruNode*>(uPtr + bucketBytesPerShard);
@@ -1113,8 +1131,8 @@ public:
     // ------------------------------------------------------------------------    
     [[nodiscard]]  
     bool Add(_In_      const TKey& Key,
-             _In_      TValue*     InValue,
-             _Out_opt_ TValue**    OutExistingValue = nullptr,
+             _In_      TValue* InValue,
+             _Out_opt_ TValue** OutExistingValue = nullptr,
              _In_      AddAction   Action = AddAction::KeepIfExists)
     {
         if (!m_Shards || InValue == nullptr) [[unlikely]]
@@ -1321,7 +1339,7 @@ public:
         uint64_t mixed = MixHash(hash);
 
         uint32_t shardIdx = static_cast<uint32_t>(mixed & (m_ShardCount - 1));
-        Shard*   shard    = &m_Shards[shardIdx];
+        Shard* shard    = &m_Shards[shardIdx];
 
         uint32_t bucketIdx = static_cast<uint32_t>(hash & shard->BucketMask);
 
@@ -1386,7 +1404,7 @@ public:
         uint64_t mixed = MixHash(hash);
 
         uint32_t shardIdx = static_cast<uint32_t>(mixed & (m_ShardCount - 1));
-        Shard*   shard    = &m_Shards[shardIdx];
+        Shard* shard    = &m_Shards[shardIdx];
 
         uint32_t bucketIdx = static_cast<uint32_t>(hash & shard->BucketMask);
 
