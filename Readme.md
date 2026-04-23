@@ -69,14 +69,15 @@ arrays, both the hash collision chains and the doubly-linked LRU queues are cons
 memory overhead and improves L1/L2 cache locality during hot-path operations.
 
 At a high level, the table is partitioned into independent shards, each managing its own hash table and LRU chain:
+
 ```text
 =============================================================================
                       [ Master Hash Table Object ]                      
 =============================================================================
       |
-      +---> [ Shard Array ] (Contiguous block, scaled to ~ CPU Cores * 8)
+      +---> [ Shard Array ] (Contiguous block, scaled to ~ CPU Cores * 32)
               |
-              +--- [ Shard 0 ] (64-byte aligned to prevent false sharing)
+              +--- [ Shard 0 ] (64/128-byte aligned to prevent false sharing)
               |      |
               |      +-- Synchronization : Exclusive TTAS Spinlock
               |      |
@@ -113,14 +114,16 @@ At a high level, the table is partitioned into independent shards, each managing
               |
               +--- [ Shard N ]
 ```
+
 #### Node Memory Layout (Mechanical Sympathy)
 To maximize L1/L2 cache hit rates, the internal node structure explicitly separates data based on access frequency during traversal:
 
 The Hot Path (First Cache Line): Variables critical for navigating collision chains and verifying matches (Hash, HashNext, LruPrev, and the Key) are tightly packed into the 
-first 64 bytes. This ensures that the CPU can scan deep hash buckets in a single memory fetch without triggering expensive main-memory stalls.
+first hardware cache line (64 bytes or 128 bytes depending on architecture). This ensures that the CPU can scan deep hash buckets in a single memory fetch without triggering expensive main-memory stalls.
 
 The Cold Path: Variables required only after a successful key match or during an eviction (Value*, LastPromoted, LruNext) are pushed off to secondary cache lines. This guarantees 
 that the memory controller never wastes bandwidth fetching payload pointers or age metrics for nodes that are merely being passed over during a lookup scan.
+
 ```text
 -------------------------------------------------
 | Hash | HashNext | LruPrev | Key |              |
@@ -144,13 +147,13 @@ Instead of allocating nodes individually on the heap, all nodes and buckets are 
 * **NUMA Awareness:** The user-mode table utilizes `VirtualAllocExNuma` (Windows) or `libnuma` (Linux) to distribute shard allocations evenly across physical CPU sockets, maximizing memory controller bandwidth.
 
 ### 3. Mechanical Sympathy & Cache Management
-Memory layout is strictly controlled to respect hardware cache lines (typically 64 bytes).
+Memory layout is strictly controlled to respect hardware-specific cache alignment, i.e., 64 bytes on x86_64 and ARM64, and 128 bytes on Apple silicon.
 
 **False Sharing Prevention:**
 ```cpp
-struct alignas(64) Shard { ... };
+struct alignas(CACHE_LINE_SIZE) Shard { ... };
 ```
-Shards are explicitly padded to 64-byte boundaries. A thread locking Shard A will never invalidate the cache line for a thread accessing Shard B.
+Shards are explicitly padded to hardware-specific cache line boundaries (64-byte or 128-byte). A thread locking Shard A will never invalidate the cache line for a thread accessing Shard B.
 
 Hot/Cold Path Struct Packing:
 ```cpp
@@ -163,7 +166,7 @@ struct LruNode
     TKey     Key;          // Starts at 16-byte boundary
     
     // --- COLD PATH ---
-    TValue*  Value;        // Accessed only on exact match
+    TValue* Value;        // Accessed only on exact match
     uint64_t LastPromoted; // Age tracking
     uint32_t LruNext;      // LRU chain index
 };
@@ -215,8 +218,8 @@ The Array-Backed table scales positively with physical hardware, whereas the sta
 
 | Implementation       | i7-1165G7 (Mobile, 8-Thread) | i7-8086K (Desktop, 12-Thread) | i7-12700H (Hybrid, 20-Thread) |
 | :------------------- | :--------------------------- | :---------------------------- | :---------------------------- |
-| **Std: Map+List**    | 0.70x (Negative Scaling)     | 0.62x (Negative Scaling)      | 0.49x (Negative Scaling)      |
-| **Array-Table**      | **3.41x** (at 8 threads)     | **6.87x** (at 12 threads)     | **7.51x** (at 20 threads)     |
+| **Std: Map+List** | 0.70x (Negative Scaling)     | 0.62x (Negative Scaling)      | 0.49x (Negative Scaling)      |
+| **Array-Table** | **3.41x** (at 8 threads)     | **6.87x** (at 12 threads)     | **7.51x** (at 20 threads)     |
 
 #### 2. Predictable Tail Latency (P99.9, P99.99)
 At extreme percentiles, the Array-Backed table maintains low-microsecond latency, bypassing the severe latency spikes characteristic of standard OS-mediated locks.
@@ -225,17 +228,17 @@ At the 99.9th percentile, we measure the worst-case algorithmic contention (e.g.
 
 | Metric (P99.9 Latency)  | i7-1165G7 (Mobile)          | i7-8086K (Desktop)         | i7-12700H (Hybrid)         |
 | :---------------------- | :-------------------------- | :------------------------- | :------------------------- |
-| **Std: Map+List**       | 1,039,800 ns                | 575,600 ns                 | 659,800  ns                |
-| **Array-Table**         | **4,900 ns**                | **1,600 ns**               | **2,600 ns**               |
-| **Stability Advantage** | **212x More Stable**        | **360x More Stable**       | **253x More Stable**       |
+| **Std: Map+List** | 1,039,800 ns                | 575,600 ns                 | 659,800  ns                |
+| **Array-Table** | **4,900 ns** | **1,600 ns** | **2,600 ns** |
+| **Stability Advantage** | **212x More Stable** | **360x More Stable** | **253x More Stable** |
 
 At the 99.99th percentile (P99.99), we observe the true cost of OS-mediated locking. 
 
 | Metric (P99.99 Latency) | i7-1165G7 (Mobile)          | i7-8086K (Desktop)         | i7-12700H (Hybrid)         |
 | :---------------------- | :-------------------------- | :------------------------- | :------------------------- |
-| **Std: Map+List**       | 2,017,400 ns                | 983,100 ns                 | 1,078,800 ns               |
-| **Array-Table**         | **12,000 ns**               | **6,400 ns**               | **20,600 ns**              |
-| **Stability Advantage** | **168x More Stable**        | **153x More Stable**       | **52x More Stable**        |
+| **Std: Map+List** | 2,017,400 ns                | 983,100 ns                 | 1,078,800 ns               |
+| **Array-Table** | **12,000 ns** | **6,400 ns** | **20,600 ns** |
+| **Stability Advantage** | **168x More Stable** | **153x More Stable** | **52x More Stable** |
 
 *(Note: The jump to 20.6µs on the i7-12700H at P99.99 is the hardware signature of the OS Thread Director migrating a thread between a P-Core and an E-Core, forcing an L1/L2 cache flush).*
 
@@ -245,9 +248,9 @@ throughput due to contention, while the sharded Array-Backed table accelerates
 
 | System Profile                  | Array-Table Ops/Sec | Std Ops/Sec       | Total Speedup       |
 | :------------------------------ | :------------------ | :---------------- | :------------------ |
-| **Mobile (4-Core/8-Thread)**    | 26.7 Million        | 3.0 Million       | **~8.9x Faster**    |
-| **Desktop (6-Core/12-Thread)**  | 53.0 Million        | 3.1 Million       | **~17.1x Faster**   |
-| **Hybrid (14-Core/20-Thread)**  | 48.0 Million        | 2.3 Million       | **~20.9x Faster**   |
+| **Mobile (4-Core/8-Thread)** | 26.7 Million        | 3.0 Million       | **~8.9x Faster** |
+| **Desktop (6-Core/12-Thread)** | 53.0 Million        | 3.1 Million       | **~17.1x Faster** |
+| **Hybrid (14-Core/20-Thread)** | 48.0 Million        | 2.3 Million       | **~20.9x Faster** |
 
 #### 4. The Impact of Lazy Promotion (Delayed LRU Updates)
 Strict LRU caches suffer under heavy read contention because every read requires an exclusive lock upgrade to update the LRU head.
@@ -260,10 +263,10 @@ Workload: 95% Read / 5% Write on the 6-Core i7-8086K.
 
 | Promotion Threshold | Behavior                  | Ops/Sec       | Performance Lift |
 | :-------------------| :------------------------ | :------------ | :--------------- |
-| **0% (Strict LRU)** | Promotes on every read    | 71.4 Million  | **Baseline**     | 
-| **25% (Safe Zone)** | Promotes only older items | 79.6 Million  | **+ 11.5%**      | 
-| **50% (Safe Zone)** | Promotes only stale items | 82.8 Million  | **+ 16.0%**      | 
-| **100% (FIFO)**     | Never promotes on read    | 86.2 Million  | **+ 20.7%**      |
+| **0% (Strict LRU)** | Promotes on every read    | 71.4 Million  | **Baseline** | 
+| **25% (Safe Zone)** | Promotes only older items | 79.6 Million  | **+ 11.5%** | 
+| **50% (Safe Zone)** | Promotes only stale items | 82.8 Million  | **+ 16.0%** | 
+| **100% (FIFO)** | Never promotes on read    | 86.2 Million  | **+ 20.7%** |
 
 
 #### 5. Cloud & Virtualized Environments: Overcoming Lock Holder Preemption (LHP)
@@ -486,8 +489,7 @@ Native Visual Studio Solution (.slnx/.sln) and Project (.vcxproj) files are incl
 **Kernel-Mode:** Build using Visual Studio 2022 and the Windows Driver Kit (WDK 11).
 * Requires C++17.
 * The implementation utilizes `EX_PUSH_LOCK` and performs NUMA-aligned allocations via `ExAllocatePool3`.
-* **IRQL Restriction:** Since the synchronization boundary uses push locks (which operate at `<= APC_LEVEL`), the current kernel implementation **can only be used at `IRQL < DISPATCH_LEVEL`** 
-(i.e., `PASSIVE_LEVEL` or `APC_LEVEL`). It is not safe for use inside DPC routines or hardware interrupt handlers. 
+* **IRQL Restriction:** Since the synchronization boundary uses push locks (which operate at `<= APC_LEVEL`), the current kernel implementation **can only be used at `IRQL < DISPATCH_LEVEL`** (i.e., `PASSIVE_LEVEL` or `APC_LEVEL`). It is not safe for use inside DPC routines or hardware interrupt handlers. 
 
 ---
 ## Conclusion & Future Hardware Extrapolation
