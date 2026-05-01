@@ -183,7 +183,8 @@ the lock is dropped, and only then is the payload destructed/released.
 Generation counter. If a read hits a "hot" item, the promotion is skipped, allowing the thread to complete the read instantly. 
 
 * **Yielding Background Trim:** Background eviction operates via high/low watermarks (e.g., 90% / 85%). Trimming drops the lock after every single item, yielding to foreground threads
-to maintain flat latency.
+to maintain flat latency. To guarantee flat P99 tail latencies, the consumer should periodically call the Trim() function from a dedicated background thread. Offloading this step removes the 
+structural overhead of inline LRU eviction (hash chain traversal, unlinking, and payload destruction) from the foreground I/O hot path.
 
 ### 5. Policy-Driven Spinlock (User Mode)
 The Array-backed table replaces std::shared_mutex with a custom Spinlock designed specifically for microscopic critical sections. It implements the TTAS pattern to strictly prevent MESI 
@@ -218,27 +219,27 @@ The Array-Backed table scales positively with physical hardware, whereas the sta
 
 | Implementation       | i7-1165G7 (Mobile, 8-Thread) | i7-8086K (Desktop, 12-Thread) | i7-12700H (Hybrid, 20-Thread) |
 | :------------------- | :--------------------------- | :---------------------------- | :---------------------------- |
-| **Std: Map+List** | 0.70x (Negative Scaling)     | 0.62x (Negative Scaling)      | 0.49x (Negative Scaling)      |
-| **Array-Table** | **3.41x** (at 8 threads)     | **6.87x** (at 12 threads)     | **7.51x** (at 20 threads)     |
+| **Std: Map+List**    | 0.70x (Negative Scaling)     | 0.62x (Negative Scaling)      | 0.49x (Negative Scaling)      |
+| **Array-Table**      | **3.41x** (at 8 threads)     | **6.87x** (at 12 threads)     | **7.51x** (at 20 threads)     |
 
 #### 2. Predictable Tail Latency (P99.9, P99.99)
 At extreme percentiles, the Array-Backed table maintains low-microsecond latency, bypassing the severe latency spikes characteristic of standard OS-mediated locks.
 
 At the 99.9th percentile, we measure the worst-case algorithmic contention (e.g., deep hash collisions or lock upgrades). The custom array maintains low-microsecond latency.
 
-| Metric (P99.9 Latency)  | i7-1165G7 (Mobile)          | i7-8086K (Desktop)         | i7-12700H (Hybrid)         |
-| :---------------------- | :-------------------------- | :------------------------- | :------------------------- |
-| **Std: Map+List** | 1,039,800 ns                | 575,600 ns                 | 659,800  ns                |
-| **Array-Table** | **4,900 ns** | **1,600 ns** | **2,600 ns** |
-| **Stability Advantage** | **212x More Stable** | **360x More Stable** | **253x More Stable** |
+| Metric (P99.9 Latency)  | i7-1165G7 (Mobile)          | i7-8086K (Desktop)          | i7-12700H (Hybrid)         |
+| :---------------------- | :-------------------------- | :-------------------------- | :------------------------- |
+| **Std: Map+List**       | 1,039,800 ns                | 575,600 ns                  | 659,800  ns                |
+| **Array-Table**         | **4,900 ns**                | **1,600 ns**                | **2,600 ns**               |
+| **Stability Advantage** | **212x More Stable**        | **360x More Stable**        | **253x More Stable**       |
 
 At the 99.99th percentile (P99.99), we observe the true cost of OS-mediated locking. 
 
 | Metric (P99.99 Latency) | i7-1165G7 (Mobile)          | i7-8086K (Desktop)         | i7-12700H (Hybrid)         |
 | :---------------------- | :-------------------------- | :------------------------- | :------------------------- |
-| **Std: Map+List** | 2,017,400 ns                | 983,100 ns                 | 1,078,800 ns               |
-| **Array-Table** | **12,000 ns** | **6,400 ns** | **20,600 ns** |
-| **Stability Advantage** | **168x More Stable** | **153x More Stable** | **52x More Stable** |
+| **Std: Map+List**       | 2,017,400 ns                | 983,100 ns                 | 1,078,800 ns               |
+| **Array-Table**         | **12,000 ns**               | **6,400 ns**               | **20,600 ns**              |
+| **Stability Advantage** | **168x More Stable**        | **153x More Stable**       | **52x More Stable**        |
 
 *(Note: The jump to 20.6µs on the i7-12700H at P99.99 is the hardware signature of the OS Thread Director migrating a thread between a P-Core and an E-Core, forcing an L1/L2 cache flush).*
 
@@ -248,9 +249,9 @@ throughput due to contention, while the sharded Array-Backed table accelerates
 
 | System Profile                  | Array-Table Ops/Sec | Std Ops/Sec       | Total Speedup       |
 | :------------------------------ | :------------------ | :---------------- | :------------------ |
-| **Mobile (4-Core/8-Thread)** | 26.7 Million        | 3.0 Million       | **~8.9x Faster** |
-| **Desktop (6-Core/12-Thread)** | 53.0 Million        | 3.1 Million       | **~17.1x Faster** |
-| **Hybrid (14-Core/20-Thread)** | 48.0 Million        | 2.3 Million       | **~20.9x Faster** |
+| **Mobile (4-Core/8-Thread)**    | 26.7 Million        | 3.0 Million       | **~8.9x Faster**    |
+| **Desktop (6-Core/12-Thread)**  | 53.0 Million        | 3.1 Million       | **~17.1x Faster**   |
+| **Hybrid (14-Core/20-Thread)**  | 48.0 Million        | 2.3 Million       | **~20.9x Faster**   |
 
 #### 4. The Impact of Lazy Promotion (Delayed LRU Updates)
 Strict LRU caches suffer under heavy read contention because every read requires an exclusive lock upgrade to update the LRU head.
@@ -263,10 +264,10 @@ Workload: 95% Read / 5% Write on the 6-Core i7-8086K.
 
 | Promotion Threshold | Behavior                  | Ops/Sec       | Performance Lift |
 | :-------------------| :------------------------ | :------------ | :--------------- |
-| **0% (Strict LRU)** | Promotes on every read    | 71.4 Million  | **Baseline** | 
-| **25% (Safe Zone)** | Promotes only older items | 79.6 Million  | **+ 11.5%** | 
-| **50% (Safe Zone)** | Promotes only stale items | 82.8 Million  | **+ 16.0%** | 
-| **100% (FIFO)** | Never promotes on read    | 86.2 Million  | **+ 20.7%** |
+| **0% (Strict LRU)** | Promotes on every read    | 71.4 Million  | **Baseline**     | 
+| **25% (Safe Zone)** | Promotes only older items | 79.6 Million  | **+ 11.5%**      | 
+| **50% (Safe Zone)** | Promotes only stale items | 82.8 Million  | **+ 16.0%**      | 
+| **100% (FIFO)**     | Never promotes on read    | 86.2 Million  | **+ 20.7%**      |
 
 
 #### 5. Cloud & Virtualized Environments: Overcoming Lock Holder Preemption (LHP)
@@ -322,13 +323,25 @@ CustomTable table;
 // Initialize with capacity 1M, and a 25% LRU Promotion Safe-Zone
 table.Initialize(1000000, 25); 
 
-// 2. Insertion
+// 2. Launch Dedicated Background Trim Thread
+std::jthread trimThread([&table](std::stop_token stoken) 
+{
+    while (!stoken.stop_requested()) 
+    {
+        // Evicts up to 5000 LRU items, but ONLY from shards 
+        // exceeding the 90% high-watermark, stopping at 85%.
+        table.Trim(5000); 
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+});
+
+// 3. Insertion
 RefCountedPayload* payload = new RefCountedPayload(data);
 payload->AddRef();
 table.Add(key, payload);
 payload->Release(); // Safely drop local reference
 
-// 3. Lookup
+// 4. Lookup
 RefCountedPayload* out = nullptr;
 if (table.Lookup(key, out)) 
 {
@@ -336,12 +349,9 @@ if (table.Lookup(key, out))
     out->Release(); // MUST release when done
 }
 
-// 4. Removal
+// 5. Removal
 table.Remove(key);
 
-// 5. Yielding background trim: Evicts up to 5000 LRU items, but ONLY 
-// from shards exceeding the 90% high-watermark, stopping at 85%.
-table.Trim(5000);
 ```
 
 ---
