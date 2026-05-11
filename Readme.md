@@ -134,7 +134,7 @@ HOT PATH (cache line)     COLD PATH
 ```
 
 ### 1. Sharded Parallelism
-The table is split into **independent, isolated shards**. Each shard contains its own hash buckets, LRU list, reader-writer lock, and capacity limits. 
+The table is split into **independent, isolated shards**. Each shard contains its own hash buckets, LRU list, spinlock, and capacity limits. 
 * Shard count is dynamically scaled based on processor topology (`shards ≈ CPU cores × 32`).
 * Threads are routed using a MurmurHash3-style avalanche mixer (`MixHash`) to force entropy into the lower bits. This ensures uniform shard distribution under typical hash quality 
 regardless of the quality of the user-provided hash function: `shard = MixHash(hash) & (ShardCount - 1)`.
@@ -182,9 +182,10 @@ the lock is dropped, and only then is the payload destructed/released.
 * **Lazy LRU Promotion (Generation Counter):** Traditional LRUs promote items to the MRU head on every read, requiring an exclusive write-lock. This implementation uses a probabilistic 
 Generation counter. If a read hits a "hot" item, the promotion is skipped, allowing the thread to complete the read instantly. 
 
-* **Yielding Background Trim:** Background eviction operates via high/low watermarks (e.g., 90% / 85%). Trimming drops the lock after every single item, yielding to foreground threads
-to maintain flat latency. To guarantee flat P99 tail latencies, the consumer should periodically call the Trim() function from a dedicated background thread. Offloading this step removes the 
-structural overhead of inline LRU eviction (hash chain traversal, unlinking, and payload destruction) from the foreground I/O hot path.
+* **Optional Proactive Trimming:** The table is fully autonomous; when a shard reaches capacity, Add() automatically performs inline LRU eviction to make room. Therefore, a dedicated
+ background trimming thread is not required for continuous operation. However, to guarantee ultra-flat P99/P99.9 tail latencies on your foreground hot path, you can optionally invoke 
+ Trim() during relatively idle cycles or from a background worker. Proactively trimming active items down to a lower watermark (e.g., 85%) ensures foreground insertions consistently 
+ hit warm, pre-allocated free nodes rather than paying the structural execution costs of inline eviction.
 
 ### 5. Policy-Driven Spinlock (User Mode)
 The Array-backed table replaces std::shared_mutex with a custom Spinlock designed specifically for microscopic critical sections. It implements the TTAS pattern to strictly prevent MESI 
@@ -323,7 +324,8 @@ CustomTable table;
 // Initialize with capacity 1M, and a 25% LRU Promotion Safe-Zone
 table.Initialize(1000000, 25); 
 
-// 2. Launch Dedicated Background Trim Thread
+// 2. Proactive Trimming (Optional optimization to maintain flat tail latency)
+// Can be executed during idle periods or scheduled via a lightweight background worker.
 std::jthread trimThread([&table](std::stop_token stoken) 
 {
     while (!stoken.stop_requested()) 
@@ -331,7 +333,7 @@ std::jthread trimThread([&table](std::stop_token stoken)
         // Evicts up to 5000 LRU items, but ONLY from shards 
         // exceeding the 90% high-watermark, stopping at 85%.
         table.Trim(5000); 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
 });
 

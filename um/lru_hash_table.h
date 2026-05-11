@@ -612,27 +612,27 @@ public:
         // CACHE LINE 0: The Lock. 
         // Spinning threads will blast this line, but it won't interfere 
         // with the lock-holder's data access.
-        alignas(CACHE_LINE_SIZE) SpinLock<TSpinWaitPolicy> Lock;     // Lock for synchronizing shard access
+        alignas(CACHE_LINE_SIZE) SpinLock<TSpinWaitPolicy> Lock;    // Lock for synchronizing shard access
 
         // Cache Line 1: Read-Heavy Hash Data
         // Exclusively owned by the thread that successfully acquires the lock
         alignas(CACHE_LINE_SIZE) LruNode* Nodes;                    // Flat array segment of pre-allocated nodes
-        uint32_t* Buckets;                  // Array segment of hash bucket heads
+        uint32_t*                         Buckets;                  // Array segment of hash bucket heads
 
-        void* RawMemoryBlock;           // Base pointer for allocator deallocation
-        size_t                AllocationSize;           // Exact size allocated on the node
+        void*                             RawMemoryBlock;           // Base pointer for allocator deallocation
+        size_t                            AllocationSize;           // Exact size allocated on the node
 
-        uint32_t              BucketMask;               // Bitwise mask used to route a hash to a specific bucket index efficiently
-        uint32_t              Capacity;                 // Maximum number of active LruNodes this specific shard can hold
+        uint32_t                           BucketMask;               // Bitwise mask used to route a hash to a specific bucket index efficiently
+        uint32_t                           Capacity;                 // Maximum number of active LruNodes this specific shard can hold
 
         // CACHE LINE 2: Write-Heavy LRU State
         // Mutated on every Add/Overwrite MRU promotion
         alignas(CACHE_LINE_SIZE) uint32_t  LruHead;                  // MRU pointer
-        uint32_t              LruTail;                  // LRU (Eviction Target)
-        uint32_t              FreeHead;                 // Unused node stack
+        uint32_t                           LruTail;                  // LRU (Eviction Target)
+        uint32_t                           FreeHead;                 // Unused node stack
 
-        uint64_t              Generation;               // Incremented on every MRU push
-        uint64_t              ThresholdAge;             // Precomputed promotion age limit
+        uint64_t                           Generation;               // Incremented on every MRU push
+        uint64_t                           ThresholdAge;             // Precomputed promotion age limit
 
         // CACHE LINE 3: Active Count
         // Mutated independently, lock-free statistical reads
@@ -640,7 +640,7 @@ public:
     };    
 
 private:
-    Shard* m_Shards;              // Dynamically allocated array representing the sharded cache architecture
+    Shard*   m_Shards;              // Dynamically allocated array representing the sharded cache architecture
     uint32_t m_ShardCount;          // Total number of initialized shards. Guaranteed to be a power of 2
     uint32_t m_PromotionThreshold;  // Percentage threshold (0-100) determining how aggressively nodes are promoted to MRU
 
@@ -1131,8 +1131,8 @@ public:
     // ------------------------------------------------------------------------    
     [[nodiscard]]  
     bool Add(_In_      const TKey& Key,
-             _In_      TValue* InValue,
-             _Out_opt_ TValue** OutExistingValue = nullptr,
+             _In_      TValue*     InValue,
+             _Out_opt_ TValue**    OutExistingValue = nullptr,
              _In_      AddAction   Action = AddAction::KeepIfExists)
     {
         if (!m_Shards || InValue == nullptr) [[unlikely]]
@@ -1233,13 +1233,17 @@ public:
             {
                 targetIdx = reservedIdx;
                 reservedIdx = INVALID_INDEX;
-                shard->ActiveCount.fetch_add(1, std::memory_order_relaxed);
+
+                uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
+                shard->ActiveCount.store(c + 1, std::memory_order_relaxed);
             }
             else if (shard->FreeHead != INVALID_INDEX) [[likely]]
             {
                 targetIdx = shard->FreeHead;
                 shard->FreeHead = shard->Nodes[targetIdx].HashNext;
-                shard->ActiveCount.fetch_add(1, std::memory_order_relaxed);
+                
+                uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
+                shard->ActiveCount.store(c + 1, std::memory_order_relaxed);
             }
             else [[unlikely]]
             {
@@ -1263,7 +1267,9 @@ public:
 
                 // Clear Value first to hide this node from concurrent Lookups
                 shard->Nodes[targetIdx].Value = nullptr;
-                shard->ActiveCount.fetch_sub(1, std::memory_order_relaxed);
+
+                uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
+                shard->ActiveCount.store(c - 1, std::memory_order_relaxed);
 
                 lockGuard.unlock();
 
@@ -1431,8 +1437,9 @@ public:
 
                 TValue* valueToRelease = shard->Nodes[curr].Value;
                 shard->Nodes[curr].Value = nullptr;
-
-                shard->ActiveCount.fetch_sub(1, std::memory_order_relaxed);
+                
+                uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
+                shard->ActiveCount.store(c - 1, std::memory_order_relaxed);
 
                 // Explicit unlock before destruction
                 lockGuard.unlock();
@@ -1536,9 +1543,10 @@ public:
                         UnlinkLru(shard, targetIdx);
 
                         TValue* valueToRelease = shard->Nodes[targetIdx].Value;
-                        shard->Nodes[targetIdx].Value = nullptr;
+                        shard->Nodes[targetIdx].Value = nullptr;                        
 
-                        shard->ActiveCount.fetch_sub(1, std::memory_order_relaxed);
+                        uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
+                        shard->ActiveCount.store(c - 1, std::memory_order_relaxed);
 
                         // Explicit unlock before destruction
                         lockGuard.unlock();

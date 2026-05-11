@@ -810,18 +810,18 @@ public:
             if (ulReservedIdx != INVALID_INDEX)
             {
                 // Fast Path A: We brought our own clean node from a previous loop iteration!
-                ulTargetIdx = ulReservedIdx;
+                ulTargetIdx   = ulReservedIdx;
                 ulReservedIdx = INVALID_INDEX;
-
-                InterlockedIncrement((LONG volatile*)&pShard->ulActiveCount);
+                
+                pShard->ulActiveCount++;
             }
             else if (pShard->ulFreeHead != INVALID_INDEX)
             {
                 // Fast Path B: Cache has unused capacity. Pop from the Free List.
-                ulTargetIdx = pShard->ulFreeHead;
+                ulTargetIdx        = pShard->ulFreeHead;
                 pShard->ulFreeHead = pShard->pNodes[ulTargetIdx].ulHashNext;
-
-                InterlockedIncrement((LONG volatile*)&pShard->ulActiveCount);
+                
+                pShard->ulActiveCount++;
             }
             else
             {
@@ -850,9 +850,8 @@ public:
                 TValue* pEvictedValue = pShard->pNodes[ulTargetIdx].pValue;
 
                 // Clear Value first to hide this node from concurrent Lookups
-                pShard->pNodes[ulTargetIdx].pValue = NULL;
-
-                InterlockedDecrement((LONG volatile*)&pShard->ulActiveCount);
+                pShard->pNodes[ulTargetIdx].pValue = NULL;                
+                pShard->ulActiveCount--;
 
                 ExReleasePushLockExclusive(&pShard->lockPush);
                 KeLeaveCriticalRegion();
@@ -1150,8 +1149,8 @@ public:
 
                         TValue* pValueToRelease = pShard->pNodes[ulTargetIdx].pValue;
 
-                        pShard->pNodes[ulTargetIdx].pValue = NULL;
-                        InterlockedDecrement((LONG volatile*)&pShard->ulActiveCount);
+                        pShard->pNodes[ulTargetIdx].pValue = NULL;                        
+                        pShard->ulActiveCount--;
 
                         ExReleasePushLockExclusive(&pShard->lockPush);
                         KeLeaveCriticalRegion();
