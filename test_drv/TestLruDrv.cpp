@@ -129,7 +129,6 @@ size_t     g_cbLogBufferMax    = 1024 * 1024 * 2; // 2 MB Allocation
 size_t     g_cbLogBufferOffset = 0;
 FAST_MUTEX g_LogMutex;
 
-// UPDATED: Added ulLevel parameter
 VOID RecordLog(_In_ ULONG ulLevel, 
                _In_ _Printf_format_string_ PCSTR pszFormat, 
                ...)
@@ -348,6 +347,8 @@ struct PerformanceMetrics
     UINT64 ullReadHeavyThroughput50;
     UINT64 ullReadHeavyThroughput75;
     UINT64 ullReadHeavyThroughput100;
+    UINT64 ullZipfianThroughput0;
+    UINT64 ullZipfianThroughput100;
 };
 
 // ----------------------------------------------------------------------------
@@ -1235,7 +1236,6 @@ BOOLEAN RunMultiThreadedCorrectnessTest()
     TEST_REQUIRE(NT_SUCCESS(Table.Initialize(CACHE_CAP, 0)), "Failed to initialize table", FALSE);
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-
     if (ulThreadCount == 0)
     {
         ulThreadCount = 4;
@@ -1448,12 +1448,13 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
 
 struct ContentionCtx
 {
-    TestTable* pTable;
+    TestTable*      pTable;
     volatile LONG64 llTotalOps;
     volatile LONG64 llTotalTrimmed;
     SIZE_T          uCacheCapacity;
     UINT32          u32ReadPercent;
     volatile LONG   lWarmUpFlag;
+    BOOLEAN         bZipfian;
 };
 
 VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
@@ -1471,7 +1472,14 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
     {
         UINT64 ullLocalOps = 0;
         UINT64 ullMaxKey = pContentionCtx->uCacheCapacity + (pContentionCtx->uCacheCapacity / 2);
-        UINT64 ullHotSet = ullMaxKey / 5;
+        
+        // Zipfian hits strictly 1% of the total key space. Standard Read-Heavy hits 20%.
+        UINT64 ullHotSet = pContentionCtx->bZipfian ? (ullMaxKey / 100) : (ullMaxKey / 5);
+
+        if (ullHotSet == 0)
+        {
+            ullHotSet = 1;
+        }
 
         // Warm-up phase (No artificial yielding needed at Priority 15)
         while (InterlockedCompareExchange(&pContentionCtx->lWarmUpFlag, 0, 0) != 0)
@@ -1481,7 +1489,37 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
                 break;
             }
 
-            UINT64 ullKey = Rng.Next() % ullMaxKey;
+            UINT64 ullKey;
+
+            if (pContentionCtx->bZipfian)
+            {
+                // 90% of requests hit the 1% hot set
+                if ((Rng.Next() % 100) < 90)
+                {
+                    ullKey = Rng.Next() % ullHotSet;
+                }
+                else
+                {
+                    ullKey = Rng.Next() % ullMaxKey;
+                }
+            }
+            else if (pContentionCtx->u32ReadPercent >= 80)
+            {
+                // 80% of requests hit the 20% hot set
+                if ((Rng.Next() % 100) < 80)
+                {
+                    ullKey = Rng.Next() % ullHotSet;
+                }
+                else
+                {
+                    ullKey = Rng.Next() % ullMaxKey;
+                }
+            }
+            else
+            {
+                ullKey = Rng.Next() % ullMaxKey;
+            }
+
             RefCountedPayload* pOut = NULL;
 
             if (pContentionCtx->pTable->Lookup(ullKey, pOut))
@@ -1500,7 +1538,18 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 
             UINT64 ullKey;
 
-            if (pContentionCtx->u32ReadPercent >= 80)
+            if (pContentionCtx->bZipfian)
+            {
+                if ((Rng.Next() % 100) < 90)
+                {
+                    ullKey = Rng.Next() % ullHotSet;
+                }
+                else
+                {
+                    ullKey = Rng.Next() % ullMaxKey;
+                }
+            }
+            else if (pContentionCtx->u32ReadPercent >= 80)
             {
                 if ((Rng.Next() % 100) < 80)
                 {
@@ -1530,6 +1579,7 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
             else if (u32OpType < pContentionCtx->u32ReadPercent + ((100 - pContentionCtx->u32ReadPercent) / 2))
             {
                 RefCountedPayload* pPayload = new RefCountedPayload(ullKey);
+                
                 if (pPayload)
                 {
                     (void)pContentionCtx->pTable->Add(ullKey, pPayload);
@@ -1632,7 +1682,6 @@ BOOLEAN RunContentionTest_NoEviction(_In_ int nSecondsToRun)
     Ctx.lWarmUpFlag    = 1;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-
     if (ulThreadCount == 0)
     {
         ulThreadCount = 4;
@@ -1718,7 +1767,6 @@ BOOLEAN RunContentionTest_EvictionThrashing(_In_ int nSecondsToRun)
     Ctx.lWarmUpFlag    = 1;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-
     if (ulThreadCount == 0)
     {
         ulThreadCount = 4;
@@ -1935,7 +1983,6 @@ UINT64 RunContentionTest_ReadHeavySkewed(_In_ int    nSecondsToRun,
     Ctx.lWarmUpFlag    = 1;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-
     if (ulThreadCount == 0)
     {
         ulThreadCount = 4;
@@ -1998,6 +2045,116 @@ UINT64 RunContentionTest_ReadHeavySkewed(_In_ int    nSecondsToRun,
     LOG_INFO("[LRU]      - Time per Op: %llu ns\n", ullTimePerOpNs);
     LOG_INFO("[LRU]      - Ops/Second: %llu\n", ullThroughput);
     LOG_INFO("[LRU] [+] Read-Heavy Skewed Complete.\n");
+
+    return ullThroughput;
+}
+
+/*
+* Simulates a Zipfian/Pareto workload where 90% of the traffic hits
+* exactly 1% of the keys. This isolates the "Hot-Key Collapse" scenario
+* typical in HFT and Web Cache architectures.
+*/
+UINT64 RunContentionTest_ZipfianSkewed(_In_ int    nSecondsToRun,
+                                       _In_ SIZE_T uCacheCapacity,
+                                       _In_ UINT32 u32PromotionThreshold = 100)
+{
+    PAGED_CODE();
+
+    LOG_INFO("\n[LRU] [*] Running Zipfian Skewed (90%% traffic on 1%% keys) for %d seconds (Cap: %llu, Thresh: %u%%)...\n", nSecondsToRun, uCacheCapacity, u32PromotionThreshold);
+
+    TestTable Table;
+
+    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold)))
+    {
+        return 0;
+    }
+
+    for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
+    {
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        {
+            return 0;
+        }
+
+        RefCountedPayload* pPayload = new RefCountedPayload(uI);
+
+        if (pPayload)
+        {
+            (void)Table.Add(uI, pPayload);
+            pPayload->Release();
+        }
+    }
+
+    ContentionCtx Ctx = { 0 };
+    Ctx.pTable         = &Table;
+    Ctx.uCacheCapacity = uCacheCapacity;
+    Ctx.u32ReadPercent = 95;
+    Ctx.lWarmUpFlag    = 1;
+    Ctx.bZipfian       = TRUE;
+
+    ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    if (ulThreadCount == 0)
+    {
+        ulThreadCount = 4;
+    }
+
+    if (ulThreadCount > MAX_TEST_THREADS)
+    {
+        ulThreadCount = MAX_TEST_THREADS;
+    }
+
+    LARGE_INTEGER liFreq, liStart, liEnd;
+    KeQueryPerformanceCounter(&liFreq);
+
+    TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
+
+    if (!pMgr)
+    {
+        LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
+        return 0;
+    }
+
+    StartThreads(pMgr, ulThreadCount, MixedWorkloadSelector, &Ctx);
+
+    LOG_INFO("[LRU]      - Warming up for 1 second...\n");
+    LARGE_INTEGER liWarmup;
+    liWarmup.QuadPart = -10000000ll;
+    KeDelayExecutionThread(KernelMode, FALSE, &liWarmup);
+
+    LOG_INFO("[LRU]      - Warm-up complete. Running benchmark for %d seconds...\n", nSecondsToRun);
+
+    InterlockedExchange(&Ctx.lWarmUpFlag, 0);
+    liStart = KeQueryPerformanceCounter(NULL);
+
+    StopAndWaitThreads(pMgr, nSecondsToRun);
+    liEnd = KeQueryPerformanceCounter(NULL);
+
+    delete pMgr;
+    Table.Cleanup();
+
+    UINT64 ullTicks = liEnd.QuadPart - liStart.QuadPart;
+
+    if (ullTicks == 0)
+    {
+        ullTicks = 1;
+    }
+
+    UINT64 ullOps = Ctx.llTotalOps;
+
+    if (ullOps == 0)
+    {
+        ullOps = 1;
+    }
+
+    UINT64 ullTimePerOpNs = (ullTicks * 1000000000ULL) / (ullOps * liFreq.QuadPart);
+    UINT64 ullThroughput = (Ctx.llTotalOps * liFreq.QuadPart) / ullTicks;
+
+    LOG_INFO("[LRU]      - Threads: %u (1 Trimmer, %u Workers)\n", ulThreadCount, ulThreadCount - 1);
+    LOG_INFO("[LRU]      - Total Operations: %llu\n", Ctx.llTotalOps);
+    LOG_INFO("[LRU]      - Total Trimmed: %llu\n", Ctx.llTotalTrimmed);
+    LOG_INFO("[LRU]      - Time per Op: %llu ns\n", ullTimePerOpNs);
+    LOG_INFO("[LRU]      - Ops/Second: %llu\n", ullThroughput);
+    LOG_INFO("[LRU] [+] Zipfian Skewed Complete.\n");
 
     return ullThroughput;
 }
@@ -2427,7 +2584,6 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
     LOG_INFO("[LRU]      ------------------------------------------\n");
 
     ULONG ulMaxThreads = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-
     if (ulMaxThreads == 0)
     {
         ulMaxThreads = 4;
@@ -2682,7 +2838,6 @@ BOOLEAN RunTailLatencyTest(_In_ SIZE_T uCacheCapacity)
     }
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-
     if (ulThreadCount == 0)
     {
         ulThreadCount = 4;
@@ -2916,6 +3071,15 @@ VOID RunBenchmarks(_In_opt_ PVOID pContext)
             CustomPerf.ullReadHeavyThroughput100 = RunContentionTest_ReadHeavySkewed(nContentionSec,
                                                                                      uContentionCap,
                                                                                      100);
+
+            ABORT_CHECK();
+            CustomPerf.ullZipfianThroughput0 = RunContentionTest_ZipfianSkewed(nContentionSec,
+                                                                               uContentionCap,
+                                                                               0);
+            ABORT_CHECK();
+            CustomPerf.ullZipfianThroughput100 = RunContentionTest_ZipfianSkewed(nContentionSec,
+                                                                                 uContentionCap,
+                                                                                 100);
 
             ABORT_CHECK();
             if (!RunTrimPerformanceTest(120000, 2))

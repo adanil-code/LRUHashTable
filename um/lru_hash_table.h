@@ -82,9 +82,9 @@
 // while preserving optimal 64-byte density for x86_64 and standard Linux ARM64.
 // ----------------------------------------------------------------------------
 #if defined(__APPLE__) && defined(__aarch64__)
-    constexpr size_t CACHE_LINE_SIZE = 128;
+constexpr size_t CACHE_LINE_SIZE = 128;
 #else        
-    constexpr size_t CACHE_LINE_SIZE = 64;
+constexpr size_t CACHE_LINE_SIZE = 64;
 #endif
 
 constexpr size_t CACHE_LINE_MASK = CACHE_LINE_SIZE - 1;
@@ -197,7 +197,7 @@ struct AdaptiveSpinPolicy
             nanosleep(&ts, nullptr);
 #else
             // Windows SwitchToThread() strictly relinquishes the time slice.
-            OsYield();            
+            OsYield();
 #endif
             // Reset the phase to resume pure spinning when we wake up.
             SpinPhase = 0;
@@ -405,7 +405,7 @@ struct DefaultNumaAllocator
                     // but if the system cannot fulfill a 4-byte allocation at this 
                     // stage, process termination due to out of memory is imminent anyway.
                     static const std::vector<uint32_t> fallback{ 0 };
-                    return fallback;                    
+                    return fallback;
                 }
             }();
 
@@ -413,22 +413,22 @@ struct DefaultNumaAllocator
     }
 
     static inline void* Allocate(_In_ size_t   size,
-                                 _In_ uint32_t node) noexcept
+        _In_ uint32_t node) noexcept
     {
 #if defined(_WIN32)
         void* ptr = VirtualAllocExNuma(GetCurrentProcess(),
-                                       NULL,
-                                       size,
-                                       MEM_RESERVE | MEM_COMMIT,
-                                       PAGE_READWRITE,
-                                       node);
+            NULL,
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            node);
         if (!ptr)
         {
             // Fallback to standard VirtualAlloc
             ptr = VirtualAlloc(NULL,
-                               size,
-                               MEM_RESERVE | MEM_COMMIT,
-                               PAGE_READWRITE);
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE);
         }
 
         return ptr;
@@ -453,7 +453,7 @@ struct DefaultNumaAllocator
     }
 
     static inline void Free(_In_ void* ptr,
-                            _In_ size_t size) noexcept
+        _In_ size_t size) noexcept
     {
         if (!ptr)
         {
@@ -542,24 +542,26 @@ enum class AddAction
 // - TValue must implement thread-safe AddRef()/Release() semantics (e.g., 
 //   atomic reference counting).
 // ----------------------------------------------------------------------------
-template <typename TKey, 
-          typename TValue, 
-          typename THasher, 
-          typename TAllocator      = DefaultNumaAllocator,
-          typename TSpinWaitPolicy = AdaptiveSpinPolicy>
+template <typename TKey,
+    typename TValue,
+    typename THasher,
+    typename TAllocator      = DefaultNumaAllocator,
+    typename TSpinWaitPolicy = AdaptiveSpinPolicy>
 class LruHashTable
 {
     // Enforce that TValue destructor is noexcept
     static_assert(std::is_nothrow_copy_constructible<TKey>::value,
-                  "TKey must be completely noexcept copy constructible to prevent node leaks during Add()");
+        "TKey must be completely noexcept copy constructible to prevent node leaks during Add()");
+
+    static_assert(std::is_nothrow_destructible<TKey>::value, "TKey must be completely noexcept destructible to prevent node leaks during Add()");
 
     // Enforce that AddRef is strictly noexcept
     static_assert(noexcept(std::declval<TValue*>()->AddRef()),
-                  "TValue::AddRef() MUST be declared noexcept to prevent state corruption during cache overwrites");
+        "TValue::AddRef() MUST be declared noexcept to prevent state corruption during cache overwrites");
 
     // Enforce that Release is strictly noexcept
     static_assert(noexcept(std::declval<TValue*>()->Release()),
-                  "TValue::Release() MUST be declared noexcept to prevent permanent capacity leaks during node eviction");
+        "TValue::Release() MUST be declared noexcept to prevent permanent capacity leaks during node eviction");
 
 public:
     static constexpr uint32_t INVALID_INDEX = 0xFFFFFFFF;
@@ -569,7 +571,7 @@ public:
     // Contains both the collision chain pointers and the doubly-linked 
     // LRU list pointers using 32-bit array indices inside the Mega-Block.
     // ------------------------------------------------------------------------
-    struct LruNode
+    struct alignas(CACHE_LINE_SIZE) LruNode
     {
         // --------------------------------------------------------------------
         // 1. HOT PATH: Hash Traversal
@@ -592,9 +594,9 @@ public:
         // Accessed only upon a definitive hash/key match or during eviction.
         // --------------------------------------------------------------------
         TValue* Value;         // Raw pointer to intrusive ref-counted object. 
-                               // Design decision: Raw pointer is used instead of 
-                               // std::shared_ptr to minimize footprint and improve 
-                               // cache locality.
+        // Design decision: Raw pointer is used instead of 
+        // std::shared_ptr to minimize footprint and improve 
+        // cache locality.
         uint64_t LastPromoted; // Tracks the "age" relative to Shard::Generation
         uint32_t LruNext;      // Index-based linked list (Less Recently Used)
     };
@@ -622,22 +624,22 @@ public:
         void*                             RawMemoryBlock;           // Base pointer for allocator deallocation
         size_t                            AllocationSize;           // Exact size allocated on the node
 
-        uint32_t                           BucketMask;               // Bitwise mask used to route a hash to a specific bucket index efficiently
-        uint32_t                           Capacity;                 // Maximum number of active LruNodes this specific shard can hold
+        uint32_t                          BucketMask;               // Bitwise mask used to route a hash to a specific bucket index efficiently
+        uint32_t                          Capacity;                 // Maximum number of active LruNodes this specific shard can hold
 
         // CACHE LINE 2: Write-Heavy LRU State
         // Mutated on every Add/Overwrite MRU promotion
-        alignas(CACHE_LINE_SIZE) uint32_t  LruHead;                  // MRU pointer
-        uint32_t                           LruTail;                  // LRU (Eviction Target)
-        uint32_t                           FreeHead;                 // Unused node stack
+        alignas(CACHE_LINE_SIZE) uint32_t LruHead;                  // MRU pointer
+        uint32_t                          LruTail;                  // LRU (Eviction Target)
+        uint32_t                          FreeHead;                 // Unused node stack
 
-        uint64_t                           Generation;               // Incremented on every MRU push
-        uint64_t                           ThresholdAge;             // Precomputed promotion age limit
+        uint64_t                          Generation;               // Incremented on every MRU push
+        uint64_t                          ThresholdAge;             // Precomputed promotion age limit
 
         // CACHE LINE 3: Active Count
         // Mutated independently, lock-free statistical reads
         alignas(CACHE_LINE_SIZE) std::atomic<uint32_t> ActiveCount;  // Tracks live items to enable O(1) capacity checks
-    };    
+    };
 
 private:
     Shard*   m_Shards;              // Dynamically allocated array representing the sharded cache architecture
@@ -691,14 +693,14 @@ private:
 
         return mixed;
     }
-   
+
     // ------------------------------------------------------------------------
     // UnlinkLru (Internal)
     // Severs a node from the doubly-linked LRU list using 32-bit indices.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
     inline void UnlinkLru(_In_ Shard* ShardPtr,
-                          _In_ uint32_t Index) noexcept
+        _In_ uint32_t Index) noexcept
     {
         uint32_t prev = ShardPtr->Nodes[Index].LruPrev;
         uint32_t next = ShardPtr->Nodes[Index].LruNext;
@@ -729,7 +731,7 @@ private:
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
     inline void PushMru(_In_ Shard* ShardPtr,
-                        _In_ uint32_t Index) noexcept
+        _In_ uint32_t Index) noexcept
     {
         ShardPtr->Generation++;
         ShardPtr->Nodes[Index].LastPromoted = ShardPtr->Generation;
@@ -757,8 +759,8 @@ private:
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
     void RemoveFromHashChain(_In_ Shard* ShardPtr,
-                             _In_ uint32_t Index) noexcept
-    {        
+        _In_ uint32_t Index) noexcept
+    {
         uint32_t bucketIdx = static_cast<uint32_t>(ShardPtr->Nodes[Index].Hash & ShardPtr->BucketMask);
 
         uint32_t curr = ShardPtr->Buckets[bucketIdx];
@@ -786,8 +788,8 @@ private:
 
 public:
     LruHashTable() noexcept : m_Shards(nullptr),
-                              m_ShardCount(0),
-                              m_PromotionThreshold(0)
+        m_ShardCount(0),
+        m_PromotionThreshold(0)
     {}
 
     ~LruHashTable() noexcept
@@ -804,7 +806,7 @@ public:
     // ------------------------------------------------------------------------
     [[nodiscard]]
     bool Initialize(_In_ const size_t TotalEntries,
-                    _In_ uint32_t     PromotionThreshold = 0) noexcept
+        _In_ uint32_t     PromotionThreshold = 0) noexcept
     {
         Cleanup();
 
@@ -1000,7 +1002,7 @@ public:
     // locks. Its goal is to provide approximate/statistical information for 
     // telemetry, prioritizing zero-contention over strict synchronization.
     // ------------------------------------------------------------------------
-   [[nodiscard]]
+    [[nodiscard]]
     size_t GetTotalMemoryUsage() const noexcept
     {
         if (!m_Shards) [[unlikely]]
@@ -1129,7 +1131,7 @@ public:
     // incremented under the lock. The caller assumes ownership and MUST call 
     // Release().
     // ------------------------------------------------------------------------    
-    [[nodiscard]]  
+    [[nodiscard]]
     bool Add(_In_      const TKey& Key,
              _In_      TValue*     InValue,
              _Out_opt_ TValue**    OutExistingValue = nullptr,
@@ -1206,18 +1208,25 @@ public:
                         PushMru(shard, curr);
                     }
 
-                    // Return reserved node to FreeList if we didn't need it
-                    if (reservedIdx != INVALID_INDEX)
-                    {
-                        shard->Nodes[reservedIdx].HashNext = shard->FreeHead;
-                        shard->FreeHead = reservedIdx;
-                    }
-
+                    // Release the lock immediately before executing arbitrary destructors or releases
                     lockGuard.unlock();
 
                     if (valueToRelease)
                     {
                         valueToRelease->Release();
+                    }
+
+                    // Handle the unused, pre-allocated node completely outside the critical section
+                    if (reservedIdx != INVALID_INDEX)
+                    {
+                        // Destruct the pre-constructed key out-of-lock
+                        shard->Nodes[reservedIdx].Key.~TKey();
+
+                        // Relock safely to return the clean node to the free list
+                        lockGuard.lock();
+
+                        shard->Nodes[reservedIdx].HashNext = shard->FreeHead;
+                        shard->FreeHead = reservedIdx;
                     }
 
                     return (Action == AddAction::ReplaceIfExists);
@@ -1231,6 +1240,7 @@ public:
 
             if (reservedIdx != INVALID_INDEX)
             {
+                // Fast Path A: We brought our own clean node from a previous loop iteration!
                 targetIdx = reservedIdx;
                 reservedIdx = INVALID_INDEX;
 
@@ -1239,15 +1249,21 @@ public:
             }
             else if (shard->FreeHead != INVALID_INDEX) [[likely]]
             {
+                // Fast Path B: Cache has unused capacity. Pop from the Free List.
                 targetIdx = shard->FreeHead;
                 shard->FreeHead = shard->Nodes[targetIdx].HashNext;
-                
-                uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
-                shard->ActiveCount.store(c + 1, std::memory_order_relaxed);
+
+                // Drop the lock completely before executing the TKey copy constructor
+                lockGuard.unlock();
+
+                new (&shard->Nodes[targetIdx].Key) TKey(Key);
+                reservedIdx = targetIdx;
+
+                continue;
             }
             else [[unlikely]]
             {
-                // Shard is Full: Evict the LRU Tail
+                // Slow Path: Cache is full. Evict the LRU Tail.
                 targetIdx = shard->LruTail;
 
                 if (targetIdx == INVALID_INDEX) [[unlikely]]
@@ -1255,8 +1271,8 @@ public:
                     // All nodes are currently "in-flight" being destructed by other 
                     // threads. Yield to let them finish and return to the FreeList
                     lockGuard.unlock();
-
                     OsYield();
+
                     continue;
                 }
 
@@ -1281,14 +1297,16 @@ public:
                     evictedValue->Release();
                 }
 
+                // Construct the new key outside the lock to minimize critical section
+                new (&shard->Nodes[targetIdx].Key) TKey(Key);
+
                 reservedIdx = targetIdx;
+
                 continue;
             }
 
-            // 3. Set metadata FIRST and only link the node LAST to prevent 
-            // Lookup() from seeing an inconsistent or half-constructed node           
+            // 3. Set metadata FIRST and only link the node LAST         
             shard->Nodes[targetIdx].Hash = hash;
-            new (&shard->Nodes[targetIdx].Key) TKey(Key);
 
             // Value is assigned AFTER the Key is fully constructed
             shard->Nodes[targetIdx].Value = InValue;
@@ -1345,7 +1363,7 @@ public:
         uint64_t mixed = MixHash(hash);
 
         uint32_t shardIdx = static_cast<uint32_t>(mixed & (m_ShardCount - 1));
-        Shard* shard    = &m_Shards[shardIdx];
+        Shard*   shard    = &m_Shards[shardIdx];
 
         uint32_t bucketIdx = static_cast<uint32_t>(hash & shard->BucketMask);
 
@@ -1410,7 +1428,7 @@ public:
         uint64_t mixed = MixHash(hash);
 
         uint32_t shardIdx = static_cast<uint32_t>(mixed & (m_ShardCount - 1));
-        Shard* shard    = &m_Shards[shardIdx];
+        Shard*    shard   = &m_Shards[shardIdx];
 
         uint32_t bucketIdx = static_cast<uint32_t>(hash & shard->BucketMask);
 
@@ -1437,7 +1455,7 @@ public:
 
                 TValue* valueToRelease = shard->Nodes[curr].Value;
                 shard->Nodes[curr].Value = nullptr;
-                
+
                 uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
                 shard->ActiveCount.store(c - 1, std::memory_order_relaxed);
 
@@ -1516,8 +1534,8 @@ public:
             }
 
             while (shard->ActiveCount.load(std::memory_order_relaxed) > 0 &&
-                  (Force || shard->ActiveCount.load(std::memory_order_relaxed) > lowWatermark) &&
-                  (TrimToWatermark || totalTrimmed < Count))
+                (Force || shard->ActiveCount.load(std::memory_order_relaxed) > lowWatermark) &&
+                (TrimToWatermark || totalTrimmed < Count))
             {
                 // Acquire RAII lock for this specific iteration
                 std::unique_lock<decltype(shard->Lock)> lockGuard(shard->Lock);
@@ -1543,7 +1561,7 @@ public:
                         UnlinkLru(shard, targetIdx);
 
                         TValue* valueToRelease = shard->Nodes[targetIdx].Value;
-                        shard->Nodes[targetIdx].Value = nullptr;                        
+                        shard->Nodes[targetIdx].Value = nullptr;
 
                         uint32_t c = shard->ActiveCount.load(std::memory_order_relaxed);
                         shard->ActiveCount.store(c - 1, std::memory_order_relaxed);

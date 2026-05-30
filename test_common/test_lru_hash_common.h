@@ -344,6 +344,8 @@ struct PerformanceMetrics
     uint64_t ReadHeavyThroughput50;
     uint64_t ReadHeavyThroughput75;
     uint64_t ReadHeavyThroughput100;
+    uint64_t ZipfianThroughput0;
+    uint64_t ZipfianThroughput100;
 };
 
 struct LatencyMetrics
@@ -1878,6 +1880,191 @@ uint64_t RunContentionTest_ReadHeavySkewed(int      SecondsToRun,
 }
 
 // ----------------------------------------------------------------------------
+// Simulates a Zipfian/Pareto workload where 90% of the traffic hits 
+// exactly 1% of the keys. This isolates the "Hot-Key Collapse" scenario 
+// typical in HFT and Web Cache architectures.
+// ----------------------------------------------------------------------------
+template <typename TTable>
+uint64_t RunContentionTest_ZipfianSkewed(int      SecondsToRun,
+                                         size_t   CacheCapacity,
+                                         uint32_t PromotionThreshold = 100)
+{
+    std::cout << "[*] Running Contention Test: Zipfian Skewed (90% traffic on 1% keys) for " 
+              << SecondsToRun << " seconds (Cap: " << CacheCapacity 
+              << ", Threshold: " << PromotionThreshold << "%)...\n";
+
+    TTable table;
+
+    TEST_REQUIRE(InitTableHelper(table, CacheCapacity, PromotionThreshold), "Failed to initialize table", 0);
+
+    for (size_t i = 0; i < CacheCapacity; ++i)
+    {
+        RefCountedPayload* p = new RefCountedPayload(i);
+        p->AddRef();
+
+        bool isAdded = table.Add(i, p);
+        (void)isAdded;
+
+        p->Release();
+    }
+
+    std::atomic<uint64_t> totalOps{ 0 };
+    std::atomic<uint64_t> totalTrimmed{ 0 };
+    std::atomic<bool> warmUpFlag{ true };
+    std::atomic<bool> stopFlag{ false };
+
+    unsigned int threadCount = std::thread::hardware_concurrency();
+
+    if (threadCount == 0)
+    {
+        threadCount = 4;
+    }
+
+    std::vector<std::thread> threads;
+
+    auto worker = [&](int threadId)
+        {
+            FastRng rng(threadId + 4000);
+            uint64_t localOps = 0;
+
+            uint64_t maxKey = CacheCapacity + (CacheCapacity / 2);
+            // Hot set is strictly 1% of the total key space
+            uint64_t hotSet = std::max<uint64_t>(1, maxKey / 100);
+
+            // Warm-up phase
+            while (warmUpFlag.load(std::memory_order_relaxed))
+            {
+                uint64_t key;
+
+                // 90% of requests hit the 1% hot set
+                if ((rng.Next() % 100) < 90)
+                {
+                    key = rng.Next() % hotSet;
+                }
+                else
+                {
+                    key = rng.Next() % maxKey;
+                }
+
+                RefCountedPayload* out = nullptr;
+                if (table.Lookup(key, out))
+                {
+                    out->Release();
+                }
+            }
+
+            // Timed benchmark phase
+            while (!stopFlag.load(std::memory_order_relaxed))
+            {
+                uint64_t key;
+
+                if ((rng.Next() % 100) < 90)
+                {
+                    key = rng.Next() % hotSet;
+                }
+                else
+                {
+                    key = rng.Next() % maxKey;
+                }
+
+                uint32_t opType = rng.Next() % 100;
+
+                if (opType < 95)
+                {
+                    RefCountedPayload* out = nullptr;
+
+                    if (table.Lookup(key, out))
+                    {
+                        out->Release();
+                    }
+                }
+                else if (opType < 98)
+                {
+                    RefCountedPayload* p = new RefCountedPayload(key);
+                    p->AddRef();
+
+                    bool isAdded = table.Add(key, p);
+                    (void)isAdded;
+
+                    p->Release();
+                }
+                else
+                {
+                    bool isRemoved = table.Remove(key);
+                    (void)isRemoved;
+                }
+
+                localOps++;
+            }
+
+            totalOps.fetch_add(localOps, std::memory_order_relaxed);
+        };
+
+    auto trimmer = [&]()
+        {
+            size_t   trimTarget = CacheCapacity / 20;
+            uint64_t localTrimmed = 0;
+
+            while (warmUpFlag.load(std::memory_order_relaxed))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            while (!stopFlag.load(std::memory_order_relaxed))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+                size_t trimmed = table.Trim(trimTarget);
+                localTrimmed += trimmed;
+            }
+
+            totalTrimmed.fetch_add(localTrimmed, std::memory_order_relaxed);
+        };
+
+    threads.emplace_back(trimmer);
+
+    for (unsigned int i = 0; i < threadCount - 1; ++i)
+    {
+        threads.emplace_back(worker, i);
+    }
+
+    std::cout << "    - Warming up for 1 second...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    std::cout << "    - Warm-up complete. Running benchmark for " << SecondsToRun << " seconds...\n";
+
+    warmUpFlag.store(false, std::memory_order_relaxed);
+    auto start = std::chrono::high_resolution_clock::now();
+
+    std::this_thread::sleep_for(std::chrono::seconds(SecondsToRun));
+
+    stopFlag.store(true, std::memory_order_relaxed);
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+
+    table.Cleanup();
+
+    uint64_t throughput = static_cast<uint64_t>(totalOps.load() / elapsed.count());
+    double timePerOpNs = (elapsed.count() * 1000000000.0) / static_cast<double>(totalOps.load());
+
+    std::cout << "    - Threads: " << threadCount << " (1 Trimmer, " << (threadCount - 1) << " Workers)\n";
+    std::cout << "    - Total Time: " << elapsed.count() << " seconds\n";
+    std::cout << "    - Total Operations: " << totalOps.load() << "\n";
+    std::cout << "    - Total Items Trimmed: " << totalTrimmed.load() << "\n";
+    std::cout << "    - Time per Op: " << timePerOpNs << " ns\n";
+    std::cout << "    - Ops/Second: " << throughput << "\n";
+    std::cout << "[+] Contention Test Complete.\n";
+
+    return throughput;
+}
+
+// ----------------------------------------------------------------------------
 // Measures the sheer speed and efficiency of the background yielding trim operation
 // when instructed to remove a specific percentage of the table.
 // ----------------------------------------------------------------------------
@@ -2628,7 +2815,7 @@ inline int RunAllTests(const char* szCustomName)
                 return false;
             }
             std::cout << "\n";
-
+            
             customPerf.ContentionThroughput = RunContentionTest_MixedWorkload<CustomTestTable>(contentionSec, contentionCap, 0);
             std::cout << "\n";
 
@@ -2648,6 +2835,12 @@ inline int RunAllTests(const char* szCustomName)
             std::cout << "\n";
 
             customPerf.ReadHeavyThroughput100 = RunContentionTest_ReadHeavySkewed<CustomTestTable>(contentionSec, contentionCap, 100);
+            std::cout << "\n";
+
+            customPerf.ZipfianThroughput0 = RunContentionTest_ZipfianSkewed<CustomTestTable>(contentionSec, contentionCap, 0);
+            std::cout << "\n";
+
+            customPerf.ZipfianThroughput100 = RunContentionTest_ZipfianSkewed<CustomTestTable>(contentionSec, contentionCap, 100);
             std::cout << "\n";
 
             if (!RunTrimPerformanceTest<CustomTestTable>(120000, 0.02))
@@ -2750,12 +2943,22 @@ inline int RunAllTests(const char* szCustomName)
             stdPerf.OversubscribedContentionThroughput = RunContentionTest_MixedWorkloadOversubscribed<StdTestTable>(contentionSec, contentionCap, 0);
             std::cout << "\n";
 
-            stdPerf.ReadHeavyThroughput0 = RunContentionTest_ReadHeavySkewed<StdTestTable>(contentionSec, contentionCap, 0);
-            stdPerf.ReadHeavyThroughput25 = stdPerf.ReadHeavyThroughput0;
-            stdPerf.ReadHeavyThroughput50 = stdPerf.ReadHeavyThroughput0;
-            stdPerf.ReadHeavyThroughput75 = stdPerf.ReadHeavyThroughput0;
+            stdPerf.ReadHeavyThroughput0   = RunContentionTest_ReadHeavySkewed<StdTestTable>(contentionSec, contentionCap, 0);
+            stdPerf.ReadHeavyThroughput25  = stdPerf.ReadHeavyThroughput0;
+            stdPerf.ReadHeavyThroughput50  = stdPerf.ReadHeavyThroughput0;
+            stdPerf.ReadHeavyThroughput75  = stdPerf.ReadHeavyThroughput0;
             stdPerf.ReadHeavyThroughput100 = stdPerf.ReadHeavyThroughput0;
             std::cout << "\n";
+
+            stdPerf.ZipfianThroughput0   = RunContentionTest_ZipfianSkewed<StdTestTable>(contentionSec, contentionCap, 0);            
+            stdPerf.ZipfianThroughput100 = stdPerf.ZipfianThroughput0;
+            std::cout << "\n";
+            // -----------------------
+
+            if (!RunTrimPerformanceTest<StdTestTable>(120000, 0.02))
+            {
+                return false;
+            }
 
             if (!RunTrimPerformanceTest<StdTestTable>(120000, 0.02))
             {
@@ -2791,11 +2994,11 @@ inline int RunAllTests(const char* szCustomName)
                       << " | Speedup Factor\n";
             std::cout << "----------------------------------------------------------------------------------------------\n";
 
-            printMultiplier("Sequential Add", customPerf.AddThroughput, stdPerf.AddThroughput);
+            printMultiplier("Sequential Add (1 thread)", customPerf.AddThroughput, stdPerf.AddThroughput);
 
-            printMultiplier("Sequential Lookup", customPerf.LookupThroughput, stdPerf.LookupThroughput);
+            printMultiplier("Sequential Lookup (1 thread)", customPerf.LookupThroughput, stdPerf.LookupThroughput);
 
-            printMultiplier("Sequential Remove", customPerf.RemoveThroughput, stdPerf.RemoveThroughput);
+            printMultiplier("Sequential Remove (1 thread)", customPerf.RemoveThroughput, stdPerf.RemoveThroughput);
 
             printMultiplier(
                 "Mixed Contention", customPerf.ContentionThroughput, stdPerf.ContentionThroughput);
@@ -2823,6 +3026,14 @@ inline int RunAllTests(const char* szCustomName)
             printMultiplier("Read-Heavy Skewed (100% Safe)",
                             customPerf.ReadHeavyThroughput100,
                             stdPerf.ReadHeavyThroughput100);
+
+            printMultiplier("Zipfian Hot-Key (0% Safe)",
+                            customPerf.ZipfianThroughput0,
+                            stdPerf.ZipfianThroughput0);
+
+            printMultiplier("Zipfian Hot-Key (100% Safe)",
+                            customPerf.ZipfianThroughput100,
+                            stdPerf.ZipfianThroughput100);
 
             // ----------------------------------------------------------------
             // Multi-Threaded Scaling Comparison

@@ -113,7 +113,7 @@ public:
     // LRU list pointers using 32-bit array indices inside the Mega-Block.    
     // ------------------------------------------------------------------------
 
-    struct LruNode
+    struct alignas(64) LruNode
     {
         // --------------------------------------------------------------------
         // 1. HOT PATH: Hash Traversal
@@ -710,7 +710,7 @@ public:
     BOOLEAN Add(_In_      const TKey& tKey,
                 _In_      TValue*     pInValue,
                 _Out_opt_ TValue**    ppOutExistingValue = NULL,
-                _In_      AddAction   Action = AddAction::KeepIfExists) noexcept
+                _In_      AddAction   Action             = AddAction::KeepIfExists) noexcept
     {
         PAGED_CODE();
 
@@ -721,8 +721,8 @@ public:
 
         UINT64 ullHash  = THasher::ComputeHash(tKey);
         UINT64 ullMixed = MixHash(ullHash);
-
-        ULONG  ulShardIdx = (ULONG)(ullMixed & (m_ulShardCount - 1));
+        
+        ULONG  ulShardIdx = (ULONG)(ullMixed & (m_ulShardCount - 1));                
         Shard* pShard     = &m_pShards[ulShardIdx];
 
         UINT32 ulBucketIdx = (UINT32)(ullHash & pShard->ulBucketMask);
@@ -784,18 +784,30 @@ public:
                         PushMru(pShard, ulCurr);
                     }
 
-                    if (ulReservedIdx != INVALID_INDEX)
-                    {
-                        pShard->pNodes[ulReservedIdx].ulHashNext = pShard->ulFreeHead;
-                        pShard->ulFreeHead = ulReservedIdx;
-                    }
-
+                    // Drop the pushlock immediately before executing arbitrary destructors or releases
                     ExReleasePushLockExclusive(&pShard->lockPush);
                     KeLeaveCriticalRegion();
 
                     if (pValueToRelease)
                     {
                         pValueToRelease->Release();
+                    }
+
+                    // Handle the unused, pre-allocated node completely outside the critical section
+                    if (ulReservedIdx != INVALID_INDEX)
+                    {
+                        // Destruct the out-of-lock duplicate key because we didn't end up using it
+                        pShard->pNodes[ulReservedIdx].tKey.~TKey();
+
+                        // Relock briefly to return the clean node to the FreeList
+                        KeEnterCriticalRegion();
+                        ExAcquirePushLockExclusive(&pShard->lockPush);
+
+                        pShard->pNodes[ulReservedIdx].ulHashNext = pShard->ulFreeHead;
+                        pShard->ulFreeHead = ulReservedIdx;
+
+                        ExReleasePushLockExclusive(&pShard->lockPush);
+                        KeLeaveCriticalRegion();
                     }
 
                     return (Action == AddAction::ReplaceIfExists) ? TRUE : FALSE;
@@ -821,7 +833,15 @@ public:
                 ulTargetIdx        = pShard->ulFreeHead;
                 pShard->ulFreeHead = pShard->pNodes[ulTargetIdx].ulHashNext;
                 
-                pShard->ulActiveCount++;
+                // Drop the pushlock completely before executing the TKey copy constructor
+                ExReleasePushLockExclusive(&pShard->lockPush);
+                KeLeaveCriticalRegion();
+
+                new (&pShard->pNodes[ulTargetIdx].tKey) TKey(tKey);
+                
+                ulReservedIdx = ulTargetIdx;
+
+                continue;
             }
             else
             {
@@ -831,8 +851,7 @@ public:
                 if (ulTargetIdx == INVALID_INDEX)
                 {
                     // Extreme Contention Edge Case: All nodes are currently "in-flight" 
-                    // being destructed by other threads. Drop the lock and yield the 
-                    // CPU to let the preempted threads return the nodes to the FreeList.
+                    // being destructed by other threads. Drop the lock and yield the CPU.
                     ExReleasePushLockExclusive(&pShard->lockPush);
                     KeLeaveCriticalRegion();
 
@@ -864,7 +883,9 @@ public:
                     pEvictedValue->Release();
                 }
 
-                // Hold onto the node locally and restart the state machine
+                // Construct and initialize key copy completely outside of the pushlock constraint
+                new (&pShard->pNodes[ulTargetIdx].tKey) TKey(tKey);
+                
                 ulReservedIdx = ulTargetIdx;
 
                 continue;
@@ -872,11 +893,12 @@ public:
 
             // 3. Set metadata FIRST and only link the node LAST to prevent 
             // Lookup() from seeing an inconsistent or half-constructed node.
+            // Due to the loop unrolling, it is mathematically guaranteed the key is constructed here.
             pShard->pNodes[ulTargetIdx].ullHash = ullHash;
-            new (&pShard->pNodes[ulTargetIdx].tKey) TKey(tKey);
-
+            
             // Value is assigned AFTER the Key is fully constructed.
             pShard->pNodes[ulTargetIdx].pValue = pInValue;
+            
             if (pInValue)
             {
                 pInValue->AddRef();
