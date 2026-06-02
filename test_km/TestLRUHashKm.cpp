@@ -14,6 +14,7 @@
 
 #define TEST_IS_KM 1
 #include <windows.h>
+#include <mmsystem.h>
 #include <iostream>
 #include <atomic>
 #include <thread>
@@ -21,6 +22,8 @@
 #include <intrin.h>
 #include <string>
 #include <new>
+
+#pragma comment(lib, "winmm.lib")
 
 // ----------------------------------------------------------------------------
 // Kernel-Mode API Stubs for User-Mode Testing
@@ -407,6 +410,8 @@ VOID KeQueryNodeActiveAffinity(_In_      USHORT          NodeNumber,
 
 int main()
 {
+    timeBeginPeriod(1);
+
     std::cout << "\n=========================================================\n";
     std::cout << "       KERNEL-MODE LRU HASH TABLE TEST SUITE             \n";
     std::cout << "=========================================================\n";
@@ -414,5 +419,8 @@ int main()
     using CustomTestTable    = CLruHashTable<uint64_t, RefCountedPayload, Hasher64Bit>;
     using CollisionTestTable = CLruHashTable<uint64_t, RefCountedPayload, DegradedHasher>;
 
-    return RunAllTests<CustomTestTable, CollisionTestTable>("KM Custom Array Table");
+    int result = RunAllTests<CustomTestTable, CollisionTestTable>("KM Custom Array Table");
+
+    timeEndPeriod(1);
+    return result;
 }

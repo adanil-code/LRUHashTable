@@ -6,7 +6,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at:
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * This software is provided on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS
  * OF ANY KIND, either express or implied.
@@ -54,6 +54,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <mutex>
 
 #if defined(_WIN32)
 #include <intrin.h>
@@ -1016,6 +1017,152 @@ bool RunMultiThreadedCorrectnessTest()
     return true;
 }
 
+// ----------------------------------------------------------------------------
+// Stresses the "Index ABA" and Out-Of-Lock TOCTOU vulnerabilities.
+// Forces an extreme collision rate and index recycling rate, intentionally
+// pausing threads while holding references to verify data stability across 
+// recycling passes.
+// ----------------------------------------------------------------------------
+template <typename TTable>
+bool RunStrictABATest()
+{
+    std::cout << "[*] Running Strict ABA Hazard & Index Recycling Test...\n";
+
+    TTable table;
+
+    // Small capacity relative to thread count to force brutal index recycling
+    const size_t   CACHE_CAP = 16;
+    const uint64_t KEY_SPACE = 32;
+
+    TEST_REQUIRE(InitTableHelper(table, CACHE_CAP, 0), "Failed to initialize table", false);
+
+    unsigned int threadCount = std::thread::hardware_concurrency();
+    if (threadCount == 0)
+    {
+        threadCount = 8;
+    }
+    
+    // Explicitly oversubscribe threads to maximize OS-level preemption during the TOCTOU gap
+    threadCount *= 2; 
+
+    const int OPS_PER_THREAD = 100000;
+    std::vector<std::thread> threads;
+    std::atomic<bool> startFlag{ false };
+    std::atomic<bool> abaCorruptionDetected{ false };
+
+    auto worker = [&](int threadId)
+        {
+            FastRng rng(threadId + 7777);
+
+            while (!startFlag.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+
+            for (int i = 0; i < OPS_PER_THREAD; ++i)
+            {
+                uint64_t key = rng.Next() % KEY_SPACE;
+                uint32_t opType = rng.Next() % 100;
+
+                if (opType < 60)
+                {
+                    // 60% Lookup
+                    RefCountedPayload* out = nullptr;
+                    if (table.Lookup(key, out))
+                    {
+                        // ABA Hazard Check:
+                        // We hold a valid ref-count on the payload. We intentionally yield our CPU slice 
+                        // to let the remaining oversubscribed threads violently thrash the cache, 
+                        // completely evict this node, push it to the free list, and recycle its underlying 
+                        // array index for a totally different key.
+                        if ((i % 15) == 0) 
+                        {
+                            std::this_thread::yield();
+                        }
+
+                        // If the table mismanaged pointer tagging, internal state mapping, or committed 
+                        // an Index ABA, `out->Data` will now point to memory owned by a different key.
+                        if (out->Data != key)
+                        {
+                            abaCorruptionDetected.store(true, std::memory_order_relaxed);
+                        }
+
+                        out->Release();
+                    }
+                }
+                else if (opType < 80)
+                {
+                    // 20% Add (Forces FreeList Pops & Evictions)
+                    RefCountedPayload* p = new RefCountedPayload(key);
+                    p->AddRef();
+
+                    bool bAdded = table.Add(key, p);
+                    (void)bAdded;
+
+                    p->Release();
+                }
+                else
+                {
+                    // 20% Remove (Forces FreeList Pushes)
+                    (void)table.Remove(key);
+                }
+            }
+        };
+
+    for (unsigned int i = 0; i < threadCount; ++i)
+    {
+        threads.emplace_back(worker, i);
+    }
+
+    startFlag.store(true, std::memory_order_release);
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    TEST_REQUIRE(!abaCorruptionDetected.load(), "ABA CORRUPTION DETECTED: Payload pointer crossed during index recycling!", false);
+
+    size_t finalCount = table.GetTotalItemCount();
+    TEST_REQUIRE(finalCount <= CACHE_CAP, "Item count exceeds capacity bounds after ABA test!", false);
+
+    // ------------------------------------------------------------------------
+    // TOCTOU Duplicate Key Hunt (Structural Hash Integrity)
+    // ------------------------------------------------------------------------
+    if constexpr (requires {
+        table.Enumerate(
+            [](const uint64_t&, RefCountedPayload*)
+            {
+                return true;
+            });
+    })
+    {
+        std::vector<uint64_t> keysFound;
+        std::mutex keysMutex;
+        bool bDuplicateFound = false;
+
+        table.Enumerate(
+            [&](const uint64_t& key, RefCountedPayload* val) -> bool
+            {
+                (void)val;
+                std::lock_guard<std::mutex> lock(keysMutex);
+
+                if (std::find(keysFound.begin(), keysFound.end(), key) != keysFound.end())
+                {
+                    bDuplicateFound = true;
+                }
+
+                keysFound.push_back(key);
+                return true;
+            });
+
+        TEST_REQUIRE(!bDuplicateFound, "DUPLICATE KEY CORRUPTION: TOCTOU race failed to protect collision chain!", false);
+    }
+
+    std::cout << "[+] Strict ABA Hazard Test Passed. Zero Index Crossings or TOCTOU Duplicates.\n";
+    return true;
+}
+
 template <typename TTable>
 PerformanceMetrics RunPerformanceTest(size_t CacheCapacity,
     size_t PrePopulateCount,
@@ -1044,7 +1191,7 @@ PerformanceMetrics RunPerformanceTest(size_t CacheCapacity,
     FastRng setupRng(0x88888888);
     for (size_t i = 0; i < PrePopulateCount; ++i)
     {
-        uint64_t key = bRandomKeys ? setupRng.Next() % (CacheCapacity * 2) : i;
+        uint64_t key = bRandomKeys ? setupRng.Next() % std::max<size_t>(1, CacheCapacity * 2) : i;
         RefCountedPayload* p = new RefCountedPayload(key);
         p->AddRef();
 
@@ -1059,7 +1206,7 @@ PerformanceMetrics RunPerformanceTest(size_t CacheCapacity,
     for (size_t i = 0; i < OperationCount; ++i)
     {
         // For random, we multiply capacity by 4 to guarantee a mix of hits and misses (forcing eviction)
-        testKeys[i] = bRandomKeys ? benchRng.Next() % (CacheCapacity * 4) : (PrePopulateCount + i);
+        testKeys[i] = bRandomKeys ? benchRng.Next() % std::max<size_t>(1, CacheCapacity * 4) : (PrePopulateCount + i);
     }
 
     const int PASSES = 4;
@@ -1421,7 +1568,7 @@ uint64_t RunContentionTest_MixedWorkload(int      SecondsToRun,
         {
             FastRng rng(threadId + 2000);
             uint64_t localOps = 0;
-            uint64_t maxKey = CacheCapacity + (CacheCapacity / 2);
+            uint64_t maxKey = std::max<uint64_t>(1ULL, static_cast<uint64_t>(CacheCapacity) + (CacheCapacity / 2));
 
             // Warm-up phase
             while (warmUpFlag.load(std::memory_order_relaxed))
@@ -1474,7 +1621,7 @@ uint64_t RunContentionTest_MixedWorkload(int      SecondsToRun,
 
     auto trimmer = [&]()
         {
-            size_t trimTarget = CacheCapacity / 20;
+            size_t trimTarget = std::max<size_t>(1, CacheCapacity / 20);
             uint64_t localTrimmed = 0;
 
             // Trimmer also waits out the warm-up phase to avoid skewing initial capacity
@@ -1586,7 +1733,7 @@ uint64_t RunContentionTest_MixedWorkloadOversubscribed(int      SecondsToRun,
         {
             FastRng rng(threadId + 2000);
             uint64_t localOps = 0;
-            uint64_t maxKey = CacheCapacity + (CacheCapacity / 2);
+            uint64_t maxKey = std::max<uint64_t>(1ULL, static_cast<uint64_t>(CacheCapacity) + (CacheCapacity / 2));
 
             // Warm-up phase
             while (warmUpFlag.load(std::memory_order_relaxed))
@@ -1632,7 +1779,7 @@ uint64_t RunContentionTest_MixedWorkloadOversubscribed(int      SecondsToRun,
 
     auto trimmer = [&]()
         {
-            size_t trimTarget = CacheCapacity / 20;
+            size_t trimTarget = std::max<size_t>(1, CacheCapacity / 20);
             uint64_t localTrimmed = 0;
 
             while (warmUpFlag.load(std::memory_order_relaxed))
@@ -1741,8 +1888,8 @@ uint64_t RunContentionTest_ReadHeavySkewed(int      SecondsToRun,
             FastRng rng(threadId + 3000);
             uint64_t localOps = 0;
 
-            uint64_t maxKey = CacheCapacity + (CacheCapacity / 2);
-            uint64_t hotSet = maxKey / 5;
+            uint64_t maxKey = std::max<uint64_t>(1ULL, static_cast<uint64_t>(CacheCapacity) + (CacheCapacity / 2));
+            uint64_t hotSet = std::max<uint64_t>(1ULL, maxKey / 5);
 
             // Warm-up phase
             while (warmUpFlag.load(std::memory_order_relaxed))
@@ -1814,7 +1961,7 @@ uint64_t RunContentionTest_ReadHeavySkewed(int      SecondsToRun,
 
     auto trimmer = [&]()
         {
-            size_t   trimTarget = CacheCapacity / 20;
+            size_t   trimTarget = std::max<size_t>(1, CacheCapacity / 20);
             uint64_t localTrimmed = 0;
 
             // Trimmer also waits out the warm-up phase
@@ -1927,9 +2074,9 @@ uint64_t RunContentionTest_ZipfianSkewed(int      SecondsToRun,
             FastRng rng(threadId + 4000);
             uint64_t localOps = 0;
 
-            uint64_t maxKey = CacheCapacity + (CacheCapacity / 2);
+            uint64_t maxKey = std::max<uint64_t>(1ULL, static_cast<uint64_t>(CacheCapacity) + (CacheCapacity / 2));
             // Hot set is strictly 1% of the total key space
-            uint64_t hotSet = std::max<uint64_t>(1, maxKey / 100);
+            uint64_t hotSet = std::max<uint64_t>(1ULL, maxKey / 100);
 
             // Warm-up phase
             while (warmUpFlag.load(std::memory_order_relaxed))
@@ -2002,7 +2149,7 @@ uint64_t RunContentionTest_ZipfianSkewed(int      SecondsToRun,
 
     auto trimmer = [&]()
         {
-            size_t   trimTarget = CacheCapacity / 20;
+            size_t   trimTarget = std::max<size_t>(1, CacheCapacity / 20);
             uint64_t localTrimmed = 0;
 
             while (warmUpFlag.load(std::memory_order_relaxed))
@@ -2361,7 +2508,7 @@ bool RunEnumerateTest(size_t CacheCapacity)
 // Includes a 1-second warm-up phase per step.
 // ----------------------------------------------------------------------------
 template <typename TTable>
-bool RunThreadScalingSweep(const char*     TestName,
+bool RunThreadScalingSweep(const char* TestName,
                            size_t          CacheCapacity,
                            int             SecondsPerStep,
                            ScalingMetrics* pOutMetrics = nullptr)
@@ -2416,7 +2563,7 @@ bool RunThreadScalingSweep(const char*     TestName,
             {
                 FastRng rng(threadId + 5000 + threadCount);
                 uint64_t localOps = 0;
-                uint64_t maxKey = CacheCapacity + (CacheCapacity / 2);
+                uint64_t maxKey = std::max<uint64_t>(1ULL, static_cast<uint64_t>(CacheCapacity) + (CacheCapacity / 2));
 
                 // Warm-up phase
                 while (warmUpFlag.load(std::memory_order_relaxed))
@@ -2526,7 +2673,7 @@ bool RunThreadScalingSweep(const char*     TestName,
 // Includes a 1-second warm-up phase.
 // ----------------------------------------------------------------------------
 template <typename TTable>
-bool RunTailLatencyTest(const char*     TestName,
+bool RunTailLatencyTest(const char* TestName,
                         size_t          CacheCapacity,
                         LatencyMetrics* pOutMetrics = nullptr)
 {
@@ -2564,7 +2711,7 @@ bool RunTailLatencyTest(const char*     TestName,
     auto worker = [&](int threadId)
         {
             FastRng rng(threadId + 8000);
-            uint64_t maxKey = CacheCapacity + (CacheCapacity / 2);
+            uint64_t maxKey = std::max<uint64_t>(1ULL, static_cast<uint64_t>(CacheCapacity) + (CacheCapacity / 2));
 
             std::vector<double>& localSamples = allThreadSamples[threadId];
             localSamples.reserve(SAMPLES_PER_THREAD);
@@ -2777,6 +2924,12 @@ inline int RunAllTests(const char* szCustomName)
             }
             std::cout << "\n";
 
+            if (!RunStrictABATest<CustomTestTable>())
+            {
+                return false;
+            }
+            std::cout << "\n";
+
             if (!RunHashCollisionTest<CollisionTestTable>())
             {
                 return false;
@@ -2908,6 +3061,12 @@ inline int RunAllTests(const char* szCustomName)
             std::cout << "\n";
 
             if (!RunMultiThreadedCorrectnessTest<StdTestTable>())
+            {
+                return false;
+            }
+            std::cout << "\n";
+
+            if (!RunStrictABATest<StdTestTable>())
             {
                 return false;
             }
