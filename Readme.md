@@ -176,28 +176,22 @@ Variables required for hash traversal packed into the first portion of the first
 collision chain probing.
 
 ### 4. Advanced Concurrency Controls
-* **Out-of-Lock Destruction:** Deadlocks and latency spikes are avoided by guaranteeing that user code never executes inside the synchronization boundary. Evicted nodes are detached, 
-the lock is dropped, and only then is the payload destructed/released.
-							   
-* **Lazy LRU Promotion (Generation Counter):** Traditional LRUs promote items to the MRU head on every read, requiring an exclusive write-lock. This implementation uses a probabilistic 
-Generation counter. If a read hits a "hot" item, the promotion is skipped, allowing the thread to complete the read instantly. 
+* **Out-of-Lock Destruction:** Deadlocks and latency spikes are avoided by guaranteeing that expensive user destruction code runs outside the synchronization boundary. Evicted nodes are detached, the lock is dropped, and only then is the payload destructed/released.
 
-* **Optional Proactive Trimming:** The table is fully autonomous; when a shard reaches capacity, Add() automatically performs inline LRU eviction to make room. Therefore, a dedicated
- background trimming thread is not required for continuous operation. However, to guarantee ultra-flat P99/P99.9 tail latencies on your foreground hot path, you can optionally invoke 
- Trim() during relatively idle cycles or from a background worker. Proactively trimming active items down to a lower watermark (e.g., 85%) ensures foreground insertions consistently 
- hit warm, pre-allocated free nodes rather than paying the structural execution costs of inline eviction.
+* **Synchronous Enumeration Warning:** While destructors run lock-free, the `Enumerate()` method executes user callbacks synchronously while holding an exclusive lock on the active shard. User callbacks MUST NOT attempt to modify the table to prevent recursive deadlocks.
+
+* **Lazy LRU Promotion (Generation Counter):** Traditional LRUs promote items to the MRU head on every read, requiring an exclusive write-lock. This implementation uses a probabilistic Generation counter. If a read hits a "hot" item, the promotion is skipped, allowing the thread to complete the read instantly. 
+
+* **Optional Proactive Trimming:** The table is fully autonomous; when a shard reaches capacity, Add() automatically performs inline LRU eviction to make room. Therefore, a dedicated background trimming thread is not required for continuous operation. However, to guarantee ultra-flat P99/P99.9 tail latencies on your foreground hot path, you can optionally invoke Trim() during relatively idle cycles or from a background worker. Proactively trimming active items down to a lower watermark (e.g., 85%) ensures foreground insertions consistently hit warm, pre-allocated free nodes rather than paying the structural execution costs of inline eviction.
 
 ### 5. Policy-Driven Spinlock (User Mode)
-The Array-backed table replaces std::shared_mutex with a custom Spinlock designed specifically for microscopic critical sections. It implements the TTAS pattern to strictly prevent MESI 
-protocol bus floods ("Cache Line Bouncing") on multi-socket / multi-core systems.
+The Array-backed table replaces std::shared_mutex with a custom Spinlock designed specifically for microscopic critical sections. It implements the TTAS pattern to strictly prevent MESI protocol bus floods ("Cache Line Bouncing") on multi-socket / multi-core systems.
 
 **Supported Spin Policies:**
 To accommodate different execution environments, the lock behavior is injected at compile-time:
 
 * **AdaptiveSpinPolicy (Default):** Maximizes throughput by spinning briefly in user-space, falling back to a forced OS deschedule to prevent deadlocks during severe contention.
-
-* **ExponentialBackoffPolicy (Opt-in):** Implements a dynamic, self-tuning backoff strategy for high-contention environments. Instead of polling the lock at a constant rate, waiting threads
-double their hardware pause batches (1, 2, 4... up to MAX_BACKOFF_PAUSES)  after every failed attempt.
+* **ExponentialBackoffPolicy (Opt-in):** Implements a dynamic, self-tuning backoff strategy for high-contention environments. Instead of polling the lock at a constant rate, waiting threads double their hardware pause batches (1, 2, 4... up to MAX_BACKOFF_PAUSES) after every failed attempt.
 
 ### 6. Adaptive Shard Scaling (Small Tables)
 To avoid synchronization overhead on small data sets, the implementation automatically scales down active shards for smaller capacities, enforcing a minimum of 64 items per shard.
@@ -220,8 +214,11 @@ The Array-Backed table scales positively with physical hardware, whereas the sta
 
 | Implementation       | i7-1165G7 (Mobile, 8-Thread) | i7-8086K (Desktop, 12-Thread) | i7-12700H (Hybrid, 20-Thread) |
 | :------------------- | :--------------------------- | :---------------------------- | :---------------------------- |
-| **Std: Map+List**    | 0.70x (Negative Scaling)     | 0.62x (Negative Scaling)      | 0.49x (Negative Scaling)      |
-| **Array-Table**      | **3.41x** (at 8 threads)     | **6.87x** (at 12 threads)     | **7.51x** (at 20 threads)     |
+| **Std: Map+List**    | 0.70x (Negative Scaling)     | 0.67x (Negative Scaling)      | 0.49x (Negative Scaling)      |
+| **Array-Table**      | **3.41x** (at 8 threads)     | **7.28x** (at 12 threads)     | **7.51x** (at 20 threads)     |
+
+#### Thread Scaling Sweep graphs (Intel Core i7-8086K)
+<img src="assets/thread_scaling_sweep.png" alt="Thread Scaling Sweep" width="1000">
 
 #### 2. Predictable Tail Latency (P99.9, P99.99)
 At extreme percentiles, the Array-Backed table maintains low-microsecond latency, bypassing the severe latency spikes characteristic of standard OS-mediated locks.
@@ -301,17 +298,12 @@ All benchmarks were produced on Windows 10/11 using the test_um suite included i
 
 ---
 ## When This Table May Not Be the Best Fit
-While this architecture excels under heavy concurrent workloads, it is not a silver bullet. In some scenarios, a standard library composition (such as `std::unordered_map` + `std::list`) 
-may be the more appropriate choice:
+While this architecture excels under heavy concurrent workloads, it is not a silver bullet. In some scenarios, a standard library composition (such as `std::unordered_map` + `std::list`) may be the more appropriate choice:
 
-* **Extremely Small Tables (< ~100 items):** While the table internally reduces shard counts when capacity is below **1024 entries**, the baseline overhead of avalanche hashing, 
-atomic reference counting, and shard routing can dominate on microscopic datasets. In these cases, a simple STL-based LRU protected by a `std::mutex` is often faster.
-* **Strictly Single-Threaded Workloads:** This table is explicitly designed to solve multi-threaded locking bottlenecks. In purely single-threaded environments, a standard STL-based LRU may 
-outperform it. The standard containers are highly optimized for uncontended execution, whereas the Array-Backed table still incurs the fixed overhead of atomic operations, memory barriers, 
-and reader-writer lock acquisitions.
-* **Highly Memory-Constrained Environments:** To achieve zero runtime allocations and prevent OS lock stalls, this table pre-allocates flat "Mega-Blocks" for its entire maximum capacity 
-upfront. If your environment cannot afford to pre-allocate the maximum potential memory footprint, you must use a traditional node-based container that allocates memory on demand.
-
+* **Massive Datasets (>4 Billion Items per Shard):** To maximize cache locality, the table utilizes 32-bit array indices instead of 64-bit pointers for its linked lists. Consequently, a single shard cannot physically address more than `UINT32_MAX` items. If your dataset exceeds this capacity per physical core, initialization will safely abort.
+* **Extremely Small Tables (< ~100 items):** While the table internally reduces shard counts when capacity is below **1024 entries**, the baseline overhead of avalanche hashing, atomic reference counting, and shard routing can dominate on microscopic datasets. In these cases, a simple STL-based LRU protected by a `std::mutex` is often faster.
+* **Strictly Single-Threaded Workloads:** This table is explicitly designed to solve multi-threaded locking bottlenecks. In purely single-threaded environments, a standard STL-based LRU may outperform it. The standard containers are highly optimized for uncontended execution, whereas the Array-Backed table still incurs the fixed overhead of atomic operations, memory barriers, and reader-writer lock acquisitions.
+* **Highly Memory-Constrained Environments:** To achieve zero OS-heap allocations and prevent lock stalls, this table pre-allocates flat "Mega-Blocks" for its entire maximum capacity upfront. (Note: Runtime placement `new` is still executed within these blocks to construct keys). If your environment cannot afford to pre-allocate the maximum potential memory footprint, you must use a traditional node-based container that allocates memory on demand.
 ---
 ## Quick Start API Overview
 Values must inherit or implement an intrusive reference counting interface (AddRef() and Release()).

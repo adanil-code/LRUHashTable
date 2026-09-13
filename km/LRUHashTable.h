@@ -357,8 +357,9 @@ public:
         ULONG ulMinItemsPerShard = 64;
 
         // Calculate the maximum number of shards we can support without 
-        // starving any shard of items
-        ULONG ulMaxShardsForCapacity = static_cast<ULONG>(uTotalEntries / ulMinItemsPerShard);
+        // starving any shard of items        
+        SIZE_T uRawMaxShards = uTotalEntries / ulMinItemsPerShard;
+        ULONG ulMaxShardsForCapacity = (uRawMaxShards > 0xFFFFFFFF) ? 0xFFFFFFFF : static_cast<ULONG>(uRawMaxShards);
 
         // Absolute fallback for legitimately tiny tables (e.g., uTotalEntries < 64).
         // This forces tiny tables into a single shard, completely preventing 
@@ -412,9 +413,17 @@ public:
         {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        
-        // Use ceiling division to prevent capacity loss from truncation
-        UINT32 ulCapacityPerShard = (UINT32)((uTotalEntries + m_ulShardCount - 1) / m_ulShardCount);
+                
+        SIZE_T uRawCapacityPerShard = (uTotalEntries + m_ulShardCount - 1) / m_ulShardCount;
+
+        // Must be strictly less than INVALID_INDEX (0xFFFFFFFF) because 
+        // INVALID_INDEX is used as the linked-list termination marker.
+        if (uRawCapacityPerShard >= INVALID_INDEX)
+        {
+            Cleanup();
+            return STATUS_INVALID_PARAMETER;
+        }
+        UINT32 ulCapacityPerShard = static_cast<UINT32>(uRawCapacityPerShard);
 
         // Absolute floor to prevent zero-capacity configuration bugs on microscopic tables
         if (ulCapacityPerShard < 8)

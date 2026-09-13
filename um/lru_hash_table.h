@@ -839,7 +839,8 @@ public:
         uint32_t minItemsPerShard = 64;
 
         // Calculate the maximum number of shards we can support
-        uint32_t maxShardsForCapacity = static_cast<uint32_t>(TotalEntries / minItemsPerShard);
+        size_t rawMaxShards = TotalEntries / minItemsPerShard;
+        uint32_t maxShardsForCapacity = (rawMaxShards > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(rawMaxShards);
 
         // Absolute fallback for tiny tables (e.g., TotalEntries < 64)
         // This forces tiny tables into a single shard, completely preventing 
@@ -895,7 +896,14 @@ public:
             }
 
             // Use ceiling division to prevent capacity loss from truncation
-            uint32_t capacityPerShard = static_cast<uint32_t>((TotalEntries + m_ShardCount - 1) / m_ShardCount);
+            size_t rawCapacityPerShard = (TotalEntries + m_ShardCount - 1) / m_ShardCount;
+            if (rawCapacityPerShard > UINT32_MAX) [[unlikely]]
+            {
+                Cleanup();
+                return false; // Cannot support the requested item density per shard
+            }
+
+            uint32_t capacityPerShard = static_cast<uint32_t>(rawCapacityPerShard);
 
             // Absolute floor to prevent zero-capacity configuration bugs on microscopic tables
             if (capacityPerShard < 8)
