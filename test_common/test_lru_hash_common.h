@@ -425,14 +425,15 @@ bool RunCorrectnessTests()
     p1->AddRef();
 
     bool bIsAdded = table.Add(1, p1);
-    TEST_REQUIRE(bIsAdded, "Initial Add failed", false);
-
     p1->Release();
+    
+    TEST_REQUIRE(bIsAdded, "Initial Add failed", false);
 
     if (table.Lookup(1, pOut))
     {
-        TEST_REQUIRE(pOut->Data == 100, "Data mismatch", false);
+        bool bDataMatch = (pOut->Data == 100);
         pOut->Release();
+        TEST_REQUIRE(bDataMatch, "Data mismatch", false);
     }
     else
     {
@@ -441,6 +442,8 @@ bool RunCorrectnessTests()
 
     RefCountedPayload* p2 = new RefCountedPayload(200);
     p2->AddRef();
+
+    bool bIsOverwritten = false;
 
     // Safely test Get-Or-Add vs Legacy Upsert
     if constexpr (requires { table.Add(1, p2, nullptr, AddAction::ReplaceIfExists); })
@@ -452,30 +455,37 @@ bool RunCorrectnessTests()
         RefCountedPayload* pExisting = nullptr;
         // Because default is KeepIfExists, it should return false and populate pExisting
         bool bAdded = table.Add(1, pGetOrAdd, &pExisting, AddAction::KeepIfExists);
-        TEST_REQUIRE(!bAdded, "Get-Or-Add should return false when key exists", false);
-        TEST_REQUIRE(pExisting != nullptr, "Get-Or-Add out parameter is null", false);
-        TEST_REQUIRE(pExisting->Data == 100, "Get-Or-Add out parameter data mismatch", false);
+        
+        bool bExistingValid = (pExisting != nullptr);
+        bool bDataMatch = bExistingValid && (pExisting->Data == 100);
 
         pGetOrAdd->Release(); // Safely releases the loser payload (caller retained ownership)
-        pExisting->Release(); // Safely releases the returned reference from the table
+        if (bExistingValid) 
+        {
+            pExisting->Release(); // Safely releases the returned reference from the table
+        }
+        
+        TEST_REQUIRE(!bAdded, "Get-Or-Add should return false when key exists", false);
+        TEST_REQUIRE(bExistingValid, "Get-Or-Add out parameter is null", false);
+        TEST_REQUIRE(bDataMatch, "Get-Or-Add out parameter data mismatch", false);
 
         // 2. Verify Explicit Overwrite works
-        bool bIsOverwritten = table.Add(1, p2, nullptr, AddAction::ReplaceIfExists);
-        TEST_REQUIRE(bIsOverwritten, "Explicit Overwrite Add failed", false);
+        bIsOverwritten = table.Add(1, p2, nullptr, AddAction::ReplaceIfExists);
     }
     else
     {
         // Fallback for StdLruHashTable (Legacy Upsert)
-        bool bIsOverwritten = table.Add(1, p2);
-        TEST_REQUIRE(bIsOverwritten, "Overwrite Add failed", false);
+        bIsOverwritten = table.Add(1, p2);
     }
 
     p2->Release();
+    TEST_REQUIRE(bIsOverwritten, "Overwrite Add failed", false);
 
     if (table.Lookup(1, pOut))
     {
-        TEST_REQUIRE(pOut->Data == 200, "Lookup failed on overwrite", false);
+        bool bDataMatch = (pOut->Data == 200);
         pOut->Release();
+        TEST_REQUIRE(bDataMatch, "Lookup failed on overwrite", false);
     }
     else
     {
@@ -518,8 +528,9 @@ bool RunCorrectnessTests()
 
     if (table.Lookup(100999, pOut))
     {
-        TEST_REQUIRE(pOut->Data == 100999, "Failed to find MRU item data mismatch", false);
+        bool bDataMatch = (pOut->Data == 100999);
         pOut->Release();
+        TEST_REQUIRE(bDataMatch, "Failed to find MRU item data mismatch", false);
     }
     else
     {
@@ -578,8 +589,9 @@ bool RunTinyTableTest()
     {
         if (table.Lookup(i, pOut))
         {
-            TEST_REQUIRE(pOut->Data == i, "Data mismatch in tiny table", false);
+            bool bDataMatch = (pOut->Data == i);
             pOut->Release();
+            TEST_REQUIRE(bDataMatch, "Data mismatch in tiny table", false);
         }
         else
         {
@@ -668,8 +680,8 @@ inline bool RunCustomAllocatorTest()
 #endif
 
 // ----------------------------------------------------------------------------
-// Forces artificial hash collisions to verify the integrity and correct traversal
-// of the intra-array singly-linked collision chains.
+// Forces artificial hash collisions to verify the integrity and correct 
+// traversal of the intra-array singly-linked collision chains.
 // ----------------------------------------------------------------------------
 template <typename TTable>
 bool RunHashCollisionTest()
@@ -696,8 +708,9 @@ bool RunHashCollisionTest()
     {
         if (table.Lookup(i, pOut))
         {
-            TEST_REQUIRE(pOut->Data == i, "Data mismatch during traversal", false);
+            bool bDataMatch = (pOut->Data == i);
             pOut->Release();
+            TEST_REQUIRE(bDataMatch, "Data mismatch during traversal", false);
         }
         else
         {
