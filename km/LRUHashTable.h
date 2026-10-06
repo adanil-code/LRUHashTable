@@ -185,21 +185,37 @@ private:
     UINT32 m_ulPromotionThreshold;  // Percentage threshold (0-100) determining how aggressively nodes are promoted to MRU
 
     // ------------------------------------------------------------------------
-    // MixHash (stripped-down version of SplitMix64)
-    // Applies a final avalanche step to the user-provided hash. 
-    // This forces entropy into the lower bits to prevent clustering when 
-    // dealing with weak hash functions (like identity hashes or sequential IDs),
-    // ensuring better distribution across power-of-2 shard masks.
-    // For the hash table only lower bits are actually matter, thus second part
-    // of SplitMix64 is omitted. This saves about 4-5 CPU cycles.
+    // MixHash (128-bit Multiply-and-Fold / wyhash-style MUM mixer)
+    // Applies a single-step 128-bit multiplication and fold to the input state:
+    // computes a 64x64 -> 128-bit product against a 64-bit prime constant
+    // (0x8bb84b93962eacc9ULL) and XOR-folds the upper and lower 64-bit halves.
+    //
+    // Replaces previous version's sequential SplitMix64 shift-multiply-shift
+    // chain with native hardware multiplier intrinsics (_umul128 on x64, 
+    // __umulh on ARM64), collapsing the dependency chain to just 2-3 instructions.
+    //
+    // Forces high-order entropy thoroughly into the lower bits to prevent
+    // clustering across power-of-2 bucket and shard masks when handling sequential
+    // IDs or weak keys. Pure register math with zero memory access makes it
+    // safe to invoke at any IRQL (PASSIVE_LEVEL through HIGH_LEVEL).
     // ------------------------------------------------------------------------
-    static constexpr UINT64 MixHash(UINT64 hash) noexcept
+    [[nodiscard]] __forceinline UINT64 MixHash(_In_ UINT64 State) noexcept
     {
-        UINT64 mixed = hash ^ (hash >> 30);
-        mixed *= 0xbf58476d1ce4e5b9ULL;
-        mixed ^= (mixed >> 27);
+        constexpr UINT64 kPrime = 0x8bb84b93962eacc9ULL;
 
-        return mixed;
+    #if defined(_M_X64) || defined(_M_AMD64)
+        UINT64 High;
+        UINT64 Low = _umul128(State, kPrime, &High);
+        return Low ^ High;
+
+    #elif defined(_M_ARM64)
+        UINT64 High = __umulh(State, kPrime);
+        UINT64 Low = State * kPrime;
+        return Low ^ High;
+
+    #else
+        #error "MixHash requires a 64-bit architecture (x64 or ARM64)."
+    #endif
     }
 
     // ------------------------------------------------------------------------
