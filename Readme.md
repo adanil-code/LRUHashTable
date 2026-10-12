@@ -146,13 +146,13 @@ Instead of allocating nodes individually on the heap, all nodes and buckets are 
 * **NUMA Awareness:** The user-mode table utilizes `VirtualAllocExNuma` (Windows) or `libnuma` (Linux) to distribute shard allocations evenly across physical CPU sockets, maximizing memory controller bandwidth.
 
 ### 3. Mechanical Sympathy & Cache Management
-Memory layout is strictly controlled to respect hardware-specific cache alignment, i.e., 64 bytes on x86_64 and ARM64, and 128 bytes on Apple silicon.
+Memory layout is strictly controlled to respect hardware-specific cache alignment. The User-Mode (UM) implementation dynamically adjusts alignment (64 bytes on x86_64/standard ARM64, and 128 bytes on Apple silicon), while the Kernel-Mode (KM) implementation statically targets 64-byte alignment for standard Windows architectures.
 
 **False Sharing Prevention:**
 ```cpp
-struct alignas(CACHE_LINE_SIZE) Shard { ... };
+struct alignas(CACHE_LINE_SIZE) Shard { ... }; // 64 or 128 bytes in UM, strictly 64 in KM
 ```
-Shards are explicitly padded to hardware-specific cache line boundaries (64-byte or 128-byte). A thread locking Shard A will never invalidate the cache line for a thread accessing Shard B.
+Shards are explicitly padded to these hardware-specific cache line boundaries. A thread locking Shard A will never invalidate the cache line for a thread accessing Shard B.
 
 Hot/Cold Path Struct Packing:
 ```cpp
@@ -171,8 +171,7 @@ struct LruNode
 };
 ```
 
-Variables required for hash traversal packed into the first portion of the first cache line. The CPU fetches these together in a single read, guaranteeing a cache hit during deep 
-collision chain probing.
+Variables required for hash traversal packed into the first portion of the first cache line. The CPU fetches these together in a single read, guaranteeing a cache hit during deep collision chain probing.
 
 ### 4. Advanced Concurrency Controls
 * **Out-of-Lock Destruction:** Deadlocks and latency spikes are avoided by guaranteeing that expensive user destruction code runs outside the synchronization boundary. Evicted nodes are detached, the lock is dropped, and only then is the payload destructed/released.
@@ -193,10 +192,9 @@ To accommodate different execution environments, the lock behavior is injected a
 * **ExponentialBackoffPolicy (Opt-in):** Implements a dynamic, self-tuning backoff strategy for high-contention environments. Instead of polling the lock at a constant rate, waiting threads double their hardware pause batches (1, 2, 4... up to MAX_BACKOFF_PAUSES) after every failed attempt.
 
 ### 6. Adaptive Shard Scaling (Small Tables)
-To avoid synchronization overhead on small data sets, the implementation automatically scales down active shards for smaller capacities, enforcing a minimum of 64 items per shard.
+To avoid synchronization overhead on small data sets, the implementation automatically scales down active shards for smaller capacities. While the shard calculation algorithm targets ~64 items per shard to safely absorb statistical hash clustering, the table enforces an absolute physical minimum of 8 items per shard.
 
-This ensures that small tables do not suffer unnecessary lock or memory
-fragmentation costs while still preserving the same API and behavior.
+This ensures that small tables do not suffer unnecessary lock or memory fragmentation costs while still preserving the same API and behavior.
 
 ---								
 ## Benchmarks & Scaling Performance
@@ -363,7 +361,7 @@ The repository is organized into distinct layers to separate the core hash table
     * `test_lru_hash_common.h`: Shared performance tests and validation logic.
 	
 * **`test_km/`**: Test code for verifying kernel-mode logic within a user-mode performance test harness.
-    * `TestLRUHashKm.cpp`: The driver-logic test harness, strictly requiring MSVC 2022/2026 on Windows.
+    * `TestLRUHashKm.cpp`: The driver-logic test harness, strictly requiring MSVC 2026 on Windows.
 	
 * **`test_um/`**: Cross-platform user-mode performance test suite.
     * `test_lru_hash.cpp`: The primary benchmark and validation tool used on Linux, macOS, and Windows.
@@ -373,7 +371,6 @@ The repository is organized into distinct layers to separate the core hash table
 
 * **`sample_um/`** : User-mode sample code.
     * `sample_lru_hash.cpp`: User-mode C++ sample showing how to use efficient string-based key with LRU Hash table.
-
 ---
 ## Building test code
 ### Linux / macOS
@@ -480,19 +477,17 @@ sudo dnf install libcap
 
 sudo setcap cap_sys_nice+ep ./build/bin/test_lru_hash
 ```
-
 ### Windows (User-Mode & Kernel-Mode)
-Native Visual Studio Solution (.slnx/.sln) and Project (.vcxproj) files are included in the repository.
+Native Visual Studio Solution (.slnx) and Project (.vcxproj) files are included in the repository.
 
-**User-Mode** Build using Visual Studio 2022 or later.
-* *Note:* If building with Visual Studio 2022, you must manually change the Platform Toolset to `v143` in the project properties.
+**User-Mode** Build using Visual Studio 2026 (or Visual Studio 2022 with the `v143` Platform Toolset).
 * Requires C++20.
 * NUMA support is handled natively via VirtualAllocExNuma.
 
-**Kernel-Mode:** Build using Visual Studio 2022 and the Windows Driver Kit (WDK 11).
-* Requires C++17.
+**Kernel-Mode:** Build using Visual Studio 2026 and the Windows Driver Kit (WDK 11).
+* Requires C++20.
 * The implementation utilizes `EX_PUSH_LOCK` and performs NUMA-aligned allocations via `ExAllocatePool3`.
-* **IRQL Restriction:** Since the synchronization boundary uses push locks (which operate at `<= APC_LEVEL`), the current kernel implementation **can only be used at `IRQL < DISPATCH_LEVEL`** (i.e., `PASSIVE_LEVEL` or `APC_LEVEL`). It is not safe for use inside DPC routines or hardware interrupt handlers. 
+* **IRQL Restriction:** Since the synchronization boundary uses push locks (which operate at `<= APC_LEVEL`), the current kernel implementation **can only be used at `IRQL < DISPATCH_LEVEL`** (i.e., `PASSIVE_LEVEL` or `APC_LEVEL`). It is not safe for use inside DPC routines or hardware interrupt handlers.
 
 ---
 ## Conclusion & Future Hardware Extrapolation

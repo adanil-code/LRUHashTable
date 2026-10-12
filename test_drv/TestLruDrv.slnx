@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="TestLruDrv.vcxproj" Id="13889a1f-df72-851c-e253-385bc5690950">
+    <Deploy />
+  </Project>
+</Solution>

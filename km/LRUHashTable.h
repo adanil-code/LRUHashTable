@@ -223,8 +223,8 @@ private:
     // Severs a node from the doubly-linked LRU list using 32-bit indices.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    __forceinline void UnlinkLru(_In_ Shard* pShardPtr,
-                                 _In_ UINT32 ulIndex) noexcept
+    __forceinline void UnlinkLru(_In_ Shard* __restrict pShardPtr,
+                                 _In_ UINT32             ulIndex) noexcept
     {
         PAGED_CODE();
 
@@ -256,8 +256,8 @@ private:
     // it as the Most Recently Used item, and updates its Generation stamp.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    __forceinline void PushMru(_In_ Shard* pShardPtr,
-                               _In_ UINT32 ulIndex) noexcept
+    __forceinline void PushMru(_In_ Shard* __restrict pShardPtr,
+                               _In_ UINT32            ulIndex) noexcept
     {
         PAGED_CODE();
 
@@ -267,7 +267,7 @@ private:
         pShardPtr->pNodes[ulIndex].ulLruPrev = INVALID_INDEX;
         pShardPtr->pNodes[ulIndex].ulLruNext = pShardPtr->ulLruHead;
 
-        if (pShardPtr->ulLruHead != INVALID_INDEX)
+        if (pShardPtr->ulLruHead != INVALID_INDEX) [[likely]]
         {
             pShardPtr->pNodes[pShardPtr->ulLruHead].ulLruPrev = ulIndex;
         }
@@ -275,7 +275,7 @@ private:
         pShardPtr->ulLruHead = ulIndex;
 
         // If the list was empty, this node is both the Head and the Tail
-        if (pShardPtr->ulLruTail == INVALID_INDEX)
+        if (pShardPtr->ulLruTail == INVALID_INDEX) [[unlikely]]
         {
             pShardPtr->ulLruTail = ulIndex;
         }
@@ -286,8 +286,8 @@ private:
     // Removes a node from the singly-linked hash collision chain.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    void RemoveFromHashChain(_In_ Shard* pShardPtr,
-                             _In_ UINT32 ulIndex) noexcept
+    void RemoveFromHashChain(_In_ Shard* __restrict pShardPtr,
+                             _In_ UINT32            ulIndex) noexcept
     {
         PAGED_CODE();
         
@@ -298,7 +298,7 @@ private:
 
         while (ulCurr != INVALID_INDEX)
         {
-            if (ulCurr == ulIndex)
+            if (ulCurr == ulIndex) [[likely]]
             {
                 if (ulPrev == INVALID_INDEX)
                 {
@@ -349,13 +349,13 @@ public:
         Cleanup();
 
         // Prevent absolute arithmetic overflow on massive capacity requests
-        if (uTotalEntries > (~(SIZE_T)0 / sizeof(LruNode)))
+        if (uTotalEntries > (~(SIZE_T)0 / sizeof(LruNode))) [[unlikely]]
         {
             return STATUS_INVALID_PARAMETER;
         }
 
         // Clamp threshold to a valid 0-100 percentage range
-        if (ulPromotionThreshold > 100)
+        if (ulPromotionThreshold > 100) [[unlikely]]
         {
             ulPromotionThreshold = 100;
         }
@@ -380,7 +380,7 @@ public:
         // Absolute fallback for legitimately tiny tables (e.g., uTotalEntries < 64).
         // This forces tiny tables into a single shard, completely preventing 
         // hash-clustering evictions.
-        if (ulMaxShardsForCapacity == 0)
+        if (ulMaxShardsForCapacity == 0) [[unlikely]]
         {
             ulMaxShardsForCapacity = 1;
         }
@@ -406,7 +406,7 @@ public:
         }
 
         // Prevent unrealistic capacity requests
-        if ((uTotalEntries / m_ulShardCount) >= (INVALID_INDEX - 1))
+        if ((uTotalEntries / m_ulShardCount) >= (INVALID_INDEX - 1)) [[unlikely]]
         {
             return STATUS_INVALID_PARAMETER;
         }
@@ -425,7 +425,7 @@ public:
                                                         POOL_TAG,
                                                         &shardExtParams,
                                                         1));
-        if (!m_pShards)
+        if (!m_pShards) [[unlikely]]
         {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -434,7 +434,7 @@ public:
 
         // Must be strictly less than INVALID_INDEX (0xFFFFFFFF) because 
         // INVALID_INDEX is used as the linked-list termination marker.
-        if (uRawCapacityPerShard >= INVALID_INDEX)
+        if (uRawCapacityPerShard >= INVALID_INDEX) [[unlikely]]
         {
             Cleanup();
             return STATUS_INVALID_PARAMETER;
@@ -442,7 +442,7 @@ public:
         UINT32 ulCapacityPerShard = static_cast<UINT32>(uRawCapacityPerShard);
 
         // Absolute floor to prevent zero-capacity configuration bugs on microscopic tables
-        if (ulCapacityPerShard < 8)
+        if (ulCapacityPerShard < 8) [[unlikely]]
         {
             ulCapacityPerShard = 8;
         }
@@ -492,7 +492,7 @@ public:
                                                                       POOL_TAG));
         ULONG ulActiveNodeCount = 0;
 
-        if (pusActiveNodes)
+        if (pusActiveNodes) [[likely]]
         {
             for (USHORT usNode = 0; usNode <= usHighestNode; ++usNode)
             {
@@ -508,7 +508,7 @@ public:
         }
 
         // If allocation failed or OS returned 0 active nodes
-        if (ulActiveNodeCount == 0)
+        if (ulActiveNodeCount == 0) [[unlikely]]
         {
             ulActiveNodeCount = ulMaxNodes;
         }
@@ -519,7 +519,7 @@ public:
             USHORT usTargetNode;
 
             // Route the shard using our compacted list of truly active nodes
-            if (pusActiveNodes && pusActiveNodes[ulIdx % ulActiveNodeCount] <= usHighestNode)
+            if (pusActiveNodes && pusActiveNodes[ulIdx % ulActiveNodeCount] <= usHighestNode) [[likely]]
             {
                 usTargetNode = pusActiveNodes[ulIdx % ulActiveNodeCount];
             }
@@ -539,7 +539,7 @@ public:
                                               POOL_TAG,
                                               &extendedParams,
                                               1);
-            if (!pRawBlock)
+            if (!pRawBlock) [[unlikely]]
             {
                 if (pusActiveNodes)
                 {
@@ -585,7 +585,7 @@ public:
         }
 
         // Clean up the temporary active node map array
-        if (pusActiveNodes)
+        if (pusActiveNodes) [[likely]]
         {
             ExFreePoolWithTag(pusActiveNodes, POOL_TAG);
         }
@@ -605,7 +605,7 @@ public:
     {
         PAGED_CODE();
 
-        if (!m_pShards)
+        if (!m_pShards) [[unlikely]]
         {
             return 0;
         }
@@ -632,7 +632,7 @@ public:
     {
         PAGED_CODE();
 
-        if (!m_pShards)
+        if (!m_pShards) [[unlikely]]
         {
             return 0;
         }
@@ -663,11 +663,11 @@ public:
     {
         PAGED_CODE();
 
-        if (m_pShards)
+        if (m_pShards) [[likely]]
         {
             for (ULONG ulIdx = 0; ulIdx < m_ulShardCount; ++ulIdx)
             {
-                if (m_pShards[ulIdx].pRawMemoryBlock)
+                if (m_pShards[ulIdx].pRawMemoryBlock) [[likely]]
                 {
                     UINT32 ulCurr = m_pShards[ulIdx].ulLruHead;
 
@@ -677,14 +677,14 @@ public:
                     {
                         UINT32 ulNext = m_pShards[ulIdx].pNodes[ulCurr].ulLruNext;
 
-                        if (ulNext != INVALID_INDEX)
+                        if (ulNext != INVALID_INDEX) [[likely]]
                         {
                             CACHE_PREFETCH(&m_pShards[ulIdx].pNodes[ulNext]);
                         }
 
                         m_pShards[ulIdx].pNodes[ulCurr].tKey.~TKey();
 
-                        if (m_pShards[ulIdx].pNodes[ulCurr].pValue)
+                        if (m_pShards[ulIdx].pNodes[ulCurr].pValue) [[likely]]
                         {
                             m_pShards[ulIdx].pNodes[ulCurr].pValue->Release();
                             m_pShards[ulIdx].pNodes[ulCurr].pValue = NULL;
@@ -732,14 +732,14 @@ public:
     // Release().
     // ------------------------------------------------------------------------    
     [[nodiscard]]
-    BOOLEAN Add(_In_      const TKey& tKey,
-                _In_      TValue*     pInValue,
-                _Out_opt_ TValue**    ppOutExistingValue = NULL,
-                _In_      AddAction   Action             = AddAction::KeepIfExists) noexcept
+    BOOLEAN Add(_In_      const TKey& __restrict tKey,
+                _In_      TValue*     __restrict pInValue,
+                _Out_opt_ TValue**    __restrict ppOutExistingValue = NULL,
+                _In_      AddAction   Action                        = AddAction::KeepIfExists) noexcept
     {
         PAGED_CODE();
 
-        if (pInValue == NULL || !m_pShards)
+        if (pInValue == NULL || !m_pShards) [[unlikely]]
         {
             return FALSE;
         }
@@ -765,7 +765,7 @@ public:
             // 1. Check if the key already exists (Collision path)
             while (ulCurr != INVALID_INDEX)
             {
-                if (pShard->pNodes[ulCurr].ullHash == ullHash && pShard->pNodes[ulCurr].tKey == tKey)
+                if (pShard->pNodes[ulCurr].ullHash == ullHash && pShard->pNodes[ulCurr].tKey == tKey) [[unlikely]]
                 {
                     TValue* pValueToRelease = NULL;
 
@@ -775,9 +775,9 @@ public:
                     {
                         pValueToRelease = NULL;
 
-                        if (ppOutExistingValue != NULL)
+                        if (ppOutExistingValue != NULL) [[unlikely]]
                         {
-                            if (pShard->pNodes[ulCurr].pValue)
+                            if (pShard->pNodes[ulCurr].pValue) [[likely]]
                             {
                                 pShard->pNodes[ulCurr].pValue->AddRef();
                             }
@@ -790,20 +790,20 @@ public:
                         pValueToRelease = pShard->pNodes[ulCurr].pValue;
                         pShard->pNodes[ulCurr].pValue = pInValue;
 
-                        if (pInValue)
+                        if (pInValue) [[likely]]
                         {
                             pInValue->AddRef();
                         }
 
                         // If caller wants the evicted value, transfer ownership
-                        if (ppOutExistingValue != NULL)
+                        if (ppOutExistingValue != NULL) [[unlikely]]
                         {
                             *ppOutExistingValue = pValueToRelease;
                             pValueToRelease = NULL; // Caller is now responsible for calling Release()
                         }
                     }
 
-                    if (ulCurr != pShard->ulLruHead)
+                    if (ulCurr != pShard->ulLruHead) [[likely]]
                     {
                         UnlinkLru(pShard, ulCurr);
                         PushMru(pShard, ulCurr);
@@ -873,7 +873,7 @@ public:
                 // Slow Path: Cache is full. Evict the LRU Tail.
                 ulTargetIdx = pShard->ulLruTail;
 
-                if (ulTargetIdx == INVALID_INDEX)
+                if (ulTargetIdx == INVALID_INDEX) [[unlikely]]
                 {
                     // Extreme Contention Edge Case: All nodes are currently "in-flight" 
                     // being destructed by other threads. Drop the lock and yield the CPU.
@@ -903,7 +903,7 @@ public:
                 // Destruct Key and Value OUTSIDE the lock to prevent deadlocks
                 pShard->pNodes[ulTargetIdx].tKey.~TKey();
 
-                if (pEvictedValue)
+                if (pEvictedValue) [[likely]]
                 {
                     pEvictedValue->Release();
                 }
@@ -924,7 +924,7 @@ public:
             // Value is assigned AFTER the Key is fully constructed.
             pShard->pNodes[ulTargetIdx].pValue = pInValue;
             
-            if (pInValue)
+            if (pInValue) [[likely]]
             {
                 pInValue->AddRef();
             }
@@ -967,14 +967,14 @@ public:
     // promotion without the hazard overhead.
     // ------------------------------------------------------------------------
     [[nodiscard]]
-    BOOLEAN Lookup(_In_  const TKey& tKey,
-                   _Out_ TValue*&    pOutValue) noexcept
+    BOOLEAN Lookup(_In_  const TKey& __restrict tKey,
+                   _Out_ TValue*&    __restrict pOutValue) noexcept
     {
         PAGED_CODE();
 
         pOutValue = NULL;
 
-        if (!m_pShards)
+        if (!m_pShards) [[unlikely]]
         {
             return FALSE;
         }
@@ -999,19 +999,19 @@ public:
             // latency while the CPU performs the Key comparison.
             UINT32 ulNext = pShard->pNodes[ulCurr].ulHashNext;
 
-            if (ulNext != INVALID_INDEX)
+            if (ulNext != INVALID_INDEX) [[likely]]
             {
                 CACHE_PREFETCH(&pShard->pNodes[ulNext]);
             }
 
-            if (pShard->pNodes[ulCurr].ullHash == ullHash && pShard->pNodes[ulCurr].tKey == tKey)
+            if (pShard->pNodes[ulCurr].ullHash == ullHash && pShard->pNodes[ulCurr].tKey == tKey) [[likely]]
             {
                 TValue* pVal = pShard->pNodes[ulCurr].pValue;
                 pVal->AddRef();
                 pOutValue = pVal;
 
                 // Optimized Threshold & Promotion Logic
-                if (ulCurr != pShard->ulLruHead)
+                if (ulCurr != pShard->ulLruHead) [[likely]]
                 {
                     // Check if node age exceeds precomputed shard threshold.
                     // Subtraction is safe against 64-bit wrap-around.
@@ -1042,11 +1042,11 @@ public:
     // Manually purges a key from the cache. The node is completely detached,
     // destructed outside the lock, and then pushed to the FreeHead stack.
     // ------------------------------------------------------------------------    
-    BOOLEAN Remove(_In_ const TKey& tKey) noexcept
+    BOOLEAN Remove(_In_ const TKey& __restrict tKey) noexcept
     {
         PAGED_CODE();
 
-        if (!m_pShards)
+        if (!m_pShards) [[unlikely]]
         {
             return FALSE;
         }
@@ -1067,7 +1067,7 @@ public:
 
         while (ulCurr != INVALID_INDEX)
         {
-            if (pShard->pNodes[ulCurr].ullHash == ullHash && pShard->pNodes[ulCurr].tKey == tKey)
+            if (pShard->pNodes[ulCurr].ullHash == ullHash && pShard->pNodes[ulCurr].tKey == tKey) [[likely]]
             {
                 if (ulPrev == INVALID_INDEX)
                 {
@@ -1091,7 +1091,7 @@ public:
                 // Destruct actual key and payload OUTSIDE lock
                 pShard->pNodes[ulCurr].tKey.~TKey();
 
-                if (pValueToRelease)
+                if (pValueToRelease) [[likely]]
                 {
                     pValueToRelease->Release();
                 }
@@ -1137,7 +1137,7 @@ public:
     {
         PAGED_CODE();
 
-        if (!m_pShards)
+        if (!m_pShards) [[unlikely]]
         {
             return 0;
         }
@@ -1158,9 +1158,9 @@ public:
             SIZE_T uHighWatermark = (pShard->ulCapacity * 90) / 100;
             SIZE_T uLowWatermark  = (pShard->ulCapacity * 85) / 100;
 
-            if (!bForce)
+            if (!bForce) [[likely]]
             {
-                if (pShard->ulActiveCount < uHighWatermark)
+                if (pShard->ulActiveCount < uHighWatermark) [[likely]]
                 {
                     continue;
                 }
@@ -1174,11 +1174,11 @@ public:
                 ExAcquirePushLockExclusive(&pShard->lockPush);
 
                 if (pShard->ulActiveCount > 0 &&
-                    (bForce || pShard->ulActiveCount > uLowWatermark))
+                    (bForce || pShard->ulActiveCount > uLowWatermark)) [[likely]]
                 {
                     UINT32 ulTargetIdx = pShard->ulLruTail;
 
-                    if (ulTargetIdx != INVALID_INDEX)
+                    if (ulTargetIdx != INVALID_INDEX) [[likely]]
                     {
                         // Traverse backwards up the LRU chain to prefetch the 
                         // node that will become the NEW tail on the next loop.
@@ -1186,7 +1186,7 @@ public:
 
                         // Issue a software prefetch to the CPU. While we are busy 
                         // doing the math to detach the current tail
-                        if (ulNextTail != INVALID_INDEX)
+                        if (ulNextTail != INVALID_INDEX) [[likely]]
                         {
                             CACHE_PREFETCH(&pShard->pNodes[ulNextTail]);
                         }
@@ -1205,7 +1205,7 @@ public:
                         // Deferred destruction logic
                         pShard->pNodes[ulTargetIdx].tKey.~TKey();
 
-                        if (pValueToRelease)
+                        if (pValueToRelease) [[likely]]
                         {
                             pValueToRelease->Release();
                         }
@@ -1263,11 +1263,11 @@ public:
     // where no concurrent threads are accessing the cache.
     // ------------------------------------------------------------------------    
     template <typename TCallback>
-    VOID Enumerate(_In_ const TCallback &Callback) noexcept
+    VOID Enumerate(_In_ const TCallback& __restrict Callback) noexcept
     {
         PAGED_CODE();
 
-        if (!m_pShards)
+        if (!m_pShards) [[unlikely]]
         {
             return;
         }
@@ -1287,13 +1287,13 @@ public:
                 // CPU to load it while we process the user callback
                 UINT32 ulNext = pShard->pNodes[ulCurr].ulLruNext;
 
-                if (ulNext != INVALID_INDEX)
+                if (ulNext != INVALID_INDEX) [[likely]]
                 {
                     CACHE_PREFETCH(&pShard->pNodes[ulNext]);
                 }
 
                 // The callback should return FALSE to abort the enumeration early
-                if (!Callback(pShard->pNodes[ulCurr].tKey, pShard->pNodes[ulCurr].pValue))
+                if (!Callback(pShard->pNodes[ulCurr].tKey, pShard->pNodes[ulCurr].pValue)) [[unlikely]]
                 {
                     ExReleasePushLockExclusive(&pShard->lockPush);
                     KeLeaveCriticalRegion();

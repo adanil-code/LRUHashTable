@@ -83,7 +83,7 @@ void* __cdecl operator new[](_In_ SIZE_T     uSize,
 
 void __cdecl operator delete(_In_opt_ void* pMemory)
 {
-    if (pMemory)
+    if (pMemory) [[likely]]
     {
         ExFreePool(pMemory);
     }
@@ -94,7 +94,7 @@ void __cdecl operator delete(_In_opt_ void* pMemory,
 {
     UNREFERENCED_PARAMETER(uSize);
 
-    if (pMemory)
+    if (pMemory) [[likely]]
     {
         ExFreePool(pMemory);
     }
@@ -102,7 +102,7 @@ void __cdecl operator delete(_In_opt_ void* pMemory,
 
 void __cdecl operator delete[](_In_opt_ void* pMemory)
 {
-    if (pMemory)
+    if (pMemory) [[likely]]
     {
         ExFreePool(pMemory);
     }
@@ -113,7 +113,7 @@ void __cdecl operator delete[](_In_opt_ void* pMemory,
 {
     UNREFERENCED_PARAMETER(uSize);
 
-    if (pMemory)
+    if (pMemory) [[likely]]
     {
         ExFreePool(pMemory);
     }
@@ -138,7 +138,7 @@ VOID RecordLog(_In_ ULONG ulLevel,
 
     char szLine[MAX_LOG_LINE];
     NTSTATUS status = RtlStringCbVPrintfA(szLine, sizeof(szLine), pszFormat, args);
-    if (NT_SUCCESS(status))
+    if (NT_SUCCESS(status)) [[likely]]
     {
         // Echo to debugger with the correct severity level
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, ulLevel, "%s", szLine);
@@ -146,12 +146,12 @@ VOID RecordLog(_In_ ULONG ulLevel,
         // Write to memory buffer
         ExAcquireFastMutex(&g_LogMutex);
         
-        if (g_pLogBuffer)
+        if (g_pLogBuffer) [[likely]]
         {
             size_t cbLen = 0;
             RtlStringCbLengthA(szLine, MAX_LOG_LINE, &cbLen);
             
-            if (g_cbLogBufferOffset + cbLen < g_cbLogBufferMax)
+            if (g_cbLogBufferOffset + cbLen < g_cbLogBufferMax) [[likely]]
             {
                 RtlCopyMemory(g_pLogBuffer + g_cbLogBufferOffset, szLine, cbLen);
                 g_cbLogBufferOffset += cbLen;
@@ -169,7 +169,7 @@ VOID FlushLogToFile()
 {
     PAGED_CODE();
 
-    if (!g_pLogBuffer || g_cbLogBufferOffset == 0)
+    if (!g_pLogBuffer || g_cbLogBufferOffset == 0) [[unlikely]]
     {
         return;
     }
@@ -195,7 +195,7 @@ VOID FlushLogToFile()
                                      NULL,
                                      0);
 
-    if (NT_SUCCESS(ntStatus))
+    if (NT_SUCCESS(ntStatus)) [[likely]]
     {
         ZwWriteFile(hFile, 
                     NULL, 
@@ -224,11 +224,11 @@ VOID FlushLogToFile()
 #define TEST_REQUIRE(condition, msg, retVal) \
     do \
     { \
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) \
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]] \
         { \
             return retVal; \
         } \
-        if (!(condition)) \
+        if (!(condition)) [[unlikely]] \
         { \
             LOG_ERR("[LRU]      [!] TEST FAILED: %s (Line %d)\n", msg, __LINE__); \
             return retVal; \
@@ -281,7 +281,7 @@ public:
 
     static void __cdecl operator delete(_In_opt_ void* pMemory)
     {
-        if (pMemory)
+        if (pMemory) [[likely]]
         {
             ExFreeToPagedLookasideList(&g_PayloadLookasideList, pMemory);
         }
@@ -376,14 +376,14 @@ struct TEST_THREAD_MANAGER
     volatile LONG       lStopFlag;
 };
 
-VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
-                  _In_     ULONG                ulCount,
-                  _In_     PTEST_WORKER_FUNC    pFunc,
-                  _In_opt_ PVOID                pUserContext)
+VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* __restrict pMgr,
+                  _In_     ULONG                           ulCount,
+                  _In_     PTEST_WORKER_FUNC               pFunc,
+                  _In_opt_ PVOID                __restrict pUserContext)
 {
     PAGED_CODE();
 
-    if (ulCount > MAX_TEST_THREADS)
+    if (ulCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulCount = MAX_TEST_THREADS;
     }
@@ -409,7 +409,7 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
                                                  (PKSTART_ROUTINE)pFunc,
                                                  &pMgr->Contexts[ulIndex]);
 
-        if (NT_SUCCESS(ntStatus))
+        if (NT_SUCCESS(ntStatus)) [[likely]]
         {
             ntStatus = ObReferenceObjectByHandle(hThread,
                                                  THREAD_ALL_ACCESS,
@@ -417,7 +417,7 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
                                                  KernelMode,
                                                  (PVOID*)&pMgr->pThreads[ulIndex],
                                                  NULL);
-            if (NT_SUCCESS(ntStatus))
+            if (NT_SUCCESS(ntStatus)) [[likely]]
             {                
                 KeSetPriorityThread((PKTHREAD)pMgr->pThreads[ulIndex], 15);
             }
@@ -448,12 +448,12 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
     KeSetEvent(&pMgr->StartEvent, IO_NO_INCREMENT, FALSE);
 }
 
-VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
-                        _In_    int                  nSleepSeconds = 0)
+VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* __restrict pMgr,
+                        _In_    int                              nSleepSeconds = 0)
 {
     PAGED_CODE();
 
-    if (nSleepSeconds > 0)
+    if (nSleepSeconds > 0) [[likely]]
     {
         LARGE_INTEGER liDelay;
         liDelay.QuadPart = -1000000ll; // 100ms per iteration to allow abort checking
@@ -461,7 +461,7 @@ VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
 
         for (int nIndex = 0; nIndex < nIterations; ++nIndex)
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -475,7 +475,7 @@ VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
 
     // Chunked Waiting Logic
     PVOID* pValidThreads = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) PVOID[pMgr->ulThreadCount];
-    if (pValidThreads != NULL)
+    if (pValidThreads != NULL) [[likely]]
     {
         ULONG ulValidCount = 0;
 
@@ -541,13 +541,13 @@ VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
 VOID SetWorkerThreadAffinity(_In_ ULONG ulThreadId)
 {
     ULONG ulTotalProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulTotalProcessors == 0)
+    if (ulTotalProcessors == 0) [[unlikely]]
     {
         ulTotalProcessors = 1;
     }
 
     PROCESSOR_NUMBER procNum;
-    if (NT_SUCCESS(KeGetProcessorNumberFromIndex(ulThreadId % ulTotalProcessors, &procNum)))
+    if (NT_SUCCESS(KeGetProcessorNumberFromIndex(ulThreadId % ulTotalProcessors, &procNum))) [[likely]]
     {
         GROUP_AFFINITY affinity = { 0 };
         affinity.Group = procNum.Group;
@@ -562,11 +562,11 @@ VOID SetWorkerThreadAffinity(_In_ ULONG ulThreadId)
 // Custom C++ templated Kernel QuickSort Implementation
 // ----------------------------------------------------------------------------
 template<typename T, typename Compare>
-void QuickSort(_Inout_updates_(uCount) T* pBase,
-               _In_                       SIZE_T  uCount,
-               _In_                       Compare Comp)
+void QuickSort(_Inout_updates_(uCount) T*     pBase,
+               _In_                    SIZE_T uCount,
+               _In_                    Compare Comp)
 {
-    if (pBase == nullptr || uCount <= 1)
+    if (pBase == nullptr || uCount <= 1) [[unlikely]]
     {
         return;
     }
@@ -687,7 +687,7 @@ void QuickSort(_Inout_updates_(uCount) T* pBase,
                 break;
             }
 
-            if (uSp >= RTL_NUMBER_OF(Stack))
+            if (uSp >= RTL_NUMBER_OF(Stack)) [[unlikely]]
             {
                 for (SIZE_T uM = uLow + 1; uM <= uHigh; ++uM)
                 {
@@ -790,14 +790,14 @@ BOOLEAN RunCorrectnessTests()
 
     for (int nIndex = 1000; nIndex < 101000; ++nIndex)
     {
-        if ((nIndex % 5000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if ((nIndex % 5000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pBulk = new RefCountedPayload(nIndex);
 
-        if (pBulk)
+        if (pBulk) [[likely]]
         {
             (void)Table.Add(nIndex, pBulk);
             pBulk->Release();
@@ -813,7 +813,7 @@ BOOLEAN RunCorrectnessTests()
     TEST_REQUIRE(uTrimmed > 0, "Trim failed to evict any items from full shards", FALSE);
     TEST_REQUIRE(Table.GetTotalItemCount() <= uTotalItems - uTrimmed, "Item count mismatch after trim", FALSE);
 
-    if (Table.Lookup(100999, pOut))
+    if (Table.Lookup(100999, pOut)) [[likely]]
     {
         TEST_REQUIRE(pOut->ullData == 100999, "Failed to find MRU item data mismatch", FALSE);
         pOut->Release();
@@ -845,7 +845,7 @@ BOOLEAN RunTinyTableTest()
 
     for (int nIndex = 0; nIndex < 25; ++nIndex)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
@@ -875,7 +875,7 @@ BOOLEAN RunTinyTableTest()
 
     for (int nIndex = 15; nIndex < 25; ++nIndex)
     {
-        if (Table.Lookup(nIndex, pOut))
+        if (Table.Lookup(nIndex, pOut)) [[likely]]
         {
             TEST_REQUIRE(pOut->ullData == nIndex, "Data mismatch in tiny table", FALSE);
             pOut->Release();
@@ -912,14 +912,14 @@ BOOLEAN RunFreeListIntegrityTest()
 
     for (int nIndex = 0; nIndex < 32; ++nIndex)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(nIndex);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(nIndex, pPayload);
             pPayload->Release();
@@ -938,14 +938,14 @@ BOOLEAN RunFreeListIntegrityTest()
 
     for (int nIndex = 100; nIndex < 132; ++nIndex)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(nIndex);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             BOOLEAN bRes = Table.Add(nIndex, pPayload);
             pPayload->Release();
@@ -977,7 +977,7 @@ BOOLEAN RunZeroCapacitySanityTest()
 
     RefCountedPayload* pPayload = new RefCountedPayload(99);
 
-    if (pPayload)
+    if (pPayload) [[likely]]
     {
         BOOLEAN bRes = Table.Add(99, pPayload);
         pPayload->Release();
@@ -1014,14 +1014,14 @@ BOOLEAN RunHashCollisionTest()
 
     for (int nIndex = 0; nIndex < 50; ++nIndex)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(nIndex);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             BOOLEAN bRes = Table.Add(nIndex, pPayload);
             pPayload->Release();
@@ -1033,12 +1033,12 @@ BOOLEAN RunHashCollisionTest()
 
     for (int nIndex = 0; nIndex < 50; ++nIndex)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
-        if (Table.Lookup(nIndex, pOut))
+        if (Table.Lookup(nIndex, pOut)) [[likely]]
         {
             TEST_REQUIRE(pOut->ullData == nIndex, "Data mismatch during traversal", FALSE);
             pOut->Release();
@@ -1075,11 +1075,11 @@ VOID EvictionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
     EvictionExhaustionCtx* pEvictionCtx = (EvictionExhaustionCtx*)pCtx->pUserContext;
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
-    if (ExAcquireRundownProtection(&g_TestRundown))
+    if (ExAcquireRundownProtection(&g_TestRundown)) [[likely]]
     {
         for (int nIndex = 0; nIndex < 50000; ++nIndex)
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -1087,7 +1087,7 @@ VOID EvictionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
             UINT64 ullKey = (pCtx->ulThreadId * 50000) + nIndex;
             RefCountedPayload* pPayload = new RefCountedPayload(ullKey);
 
-            if (pPayload)
+            if (pPayload) [[likely]]
             {
                 (void)pEvictionCtx->pTable->Add(ullKey, pPayload);
                 pPayload->Release();
@@ -1128,7 +1128,7 @@ BOOLEAN RunEvictionAndExhaustionTest()
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
         return FALSE;
@@ -1165,13 +1165,13 @@ VOID MtCorrectnessWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
-    if (ExAcquireRundownProtection(&g_TestRundown))
+    if (ExAcquireRundownProtection(&g_TestRundown)) [[likely]]
     {
         const int OPS_PER_THREAD = 100000;
 
         for (int i = 0; i < OPS_PER_THREAD; ++i)
         {
-            if (InterlockedCompareExchange(pCtx->plStopFlag, 0, 0) || InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(pCtx->plStopFlag, 0, 0) || InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -1187,7 +1187,7 @@ VOID MtCorrectnessWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
                 if (pMtCtx->pTable->Lookup(ullKey, pOut))
                 {
                     // Strict Data Integrity Check
-                    if (pOut->ullData != ullKey)
+                    if (pOut->ullData != ullKey) [[unlikely]]
                     {
                         InterlockedExchange(&pMtCtx->lDataCorruption, 1);
                     }
@@ -1200,7 +1200,7 @@ VOID MtCorrectnessWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
                 // 25% Add
                 RefCountedPayload* pPayload = new RefCountedPayload(ullKey);
 
-                if (pPayload)
+                if (pPayload) [[likely]]
                 {
                     (void)pMtCtx->pTable->Add(ullKey, pPayload);
                     pPayload->Release();
@@ -1236,12 +1236,12 @@ BOOLEAN RunMultiThreadedCorrectnessTest()
     TEST_REQUIRE(NT_SUCCESS(Table.Initialize(CACHE_CAP, 0)), "Failed to initialize table", FALSE);
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulThreadCount == 0)
+    if (ulThreadCount == 0) [[unlikely]]
     {
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAX_TEST_THREADS)
+    if (ulThreadCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulThreadCount = MAX_TEST_THREADS;
     }
@@ -1253,7 +1253,7 @@ BOOLEAN RunMultiThreadedCorrectnessTest()
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
         return FALSE;
@@ -1275,9 +1275,9 @@ BOOLEAN RunMultiThreadedCorrectnessTest()
     Table.Enumerate([&](const UINT64& ullKey,
         RefCountedPayload* pVal) -> BOOLEAN
         {
-            if (pVal)
+            if (pVal) [[likely]]
             {
-                if (pVal->ullData != ullKey)
+                if (pVal->ullData != ullKey) [[unlikely]]
                 {
                     InterlockedExchange(&Ctx.lDataCorruption, 1);
                 }
@@ -1311,7 +1311,7 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
     PerformanceMetrics Metrics = { 0 };
     TestTable Table;
 
-    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold)))
+    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold))) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Initialize failed\n");
         return Metrics;
@@ -1325,14 +1325,14 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
 
     for (SIZE_T uI = 0; uI < uPrePopulateCount; ++uI)
     {
-        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return Metrics;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -1353,7 +1353,7 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
 
     for (int nPass = 0; nPass < nPasses; ++nPass)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return Metrics;
         }
@@ -1362,14 +1362,14 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
 
         for (SIZE_T uI = uPrePopulateCount; uI < uPrePopulateCount + uOperationCount; ++uI)
         {
-            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 return Metrics;
             }
 
             RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-            if (pPayload)
+            if (pPayload) [[likely]]
             {
                 (void)Table.Add(uI, pPayload);
                 pPayload->Release();
@@ -1383,7 +1383,7 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
 
         for (SIZE_T uI = uPrePopulateCount; uI < uPrePopulateCount + uOperationCount; ++uI)
         {
-            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 return Metrics;
             }
@@ -1403,7 +1403,7 @@ PerformanceMetrics RunPerformanceTest(_In_   SIZE_T      uCacheCapacity,
 
         for (SIZE_T uI = uPrePopulateCount; uI < uPrePopulateCount + uOperationCount; ++uI)
         {
-            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 return Metrics;
             }
@@ -1468,7 +1468,7 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
-    if (ExAcquireRundownProtection(&g_TestRundown))
+    if (ExAcquireRundownProtection(&g_TestRundown)) [[likely]]
     {
         UINT64 ullLocalOps = 0;
         UINT64 ullMaxKey = pContentionCtx->uCacheCapacity + (pContentionCtx->uCacheCapacity / 2);
@@ -1484,7 +1484,7 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
         // Warm-up phase (No artificial yielding needed at Priority 15)
         while (InterlockedCompareExchange(&pContentionCtx->lWarmUpFlag, 0, 0) != 0)
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -1531,7 +1531,7 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
         // Timed benchmark phase
         while (!InterlockedCompareExchange(pCtx->plStopFlag, 0, 0))
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -1580,7 +1580,7 @@ VOID ContentionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
             {
                 RefCountedPayload* pPayload = new RefCountedPayload(ullKey);
                 
-                if (pPayload)
+                if (pPayload) [[likely]]
                 {
                     (void)pContentionCtx->pTable->Add(ullKey, pPayload);
                     pPayload->Release();
@@ -1610,7 +1610,7 @@ VOID ContentionTrimmer(_Inout_ TEST_WORKER_CONTEXT* pCtx)
     ContentionCtx* pContentionCtx = (ContentionCtx*)pCtx->pUserContext;
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
-    if (ExAcquireRundownProtection(&g_TestRundown))
+    if (ExAcquireRundownProtection(&g_TestRundown)) [[likely]]
     {
         SIZE_T uTrimTarget = pContentionCtx->uCacheCapacity / 20;
         UINT64 ullLocalTrimmed = 0;
@@ -1621,7 +1621,7 @@ VOID ContentionTrimmer(_Inout_ TEST_WORKER_CONTEXT* pCtx)
         // Trimmer also waits out the warm-up phase
         while (InterlockedCompareExchange(&pContentionCtx->lWarmUpFlag, 0, 0) != 0)
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -1631,7 +1631,7 @@ VOID ContentionTrimmer(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 
         while (!InterlockedCompareExchange(pCtx->plStopFlag, 0, 0))
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -1682,12 +1682,12 @@ BOOLEAN RunContentionTest_NoEviction(_In_ int nSecondsToRun)
     Ctx.lWarmUpFlag    = 1;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulThreadCount == 0)
+    if (ulThreadCount == 0) [[unlikely]]
     {
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAX_TEST_THREADS)
+    if (ulThreadCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulThreadCount = MAX_TEST_THREADS;
     }
@@ -1697,7 +1697,7 @@ BOOLEAN RunContentionTest_NoEviction(_In_ int nSecondsToRun)
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
         return FALSE;
@@ -1767,12 +1767,12 @@ BOOLEAN RunContentionTest_EvictionThrashing(_In_ int nSecondsToRun)
     Ctx.lWarmUpFlag    = 1;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulThreadCount == 0)
+    if (ulThreadCount == 0) [[unlikely]]
     {
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAX_TEST_THREADS)
+    if (ulThreadCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulThreadCount = MAX_TEST_THREADS;
     }
@@ -1782,7 +1782,7 @@ BOOLEAN RunContentionTest_EvictionThrashing(_In_ int nSecondsToRun)
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
         return FALSE;
@@ -1846,21 +1846,21 @@ UINT64 RunContentionTest_MixedWorkload(_In_ int    nSecondsToRun,
 
     TestTable Table;
 
-    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold)))
+    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold))) [[unlikely]]
     {
         return 0;
     }
 
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return 0;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -1874,12 +1874,12 @@ UINT64 RunContentionTest_MixedWorkload(_In_ int    nSecondsToRun,
     Ctx.lWarmUpFlag = 1;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulThreadCount == 0)
+    if (ulThreadCount == 0) [[unlikely]]
     {
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAX_TEST_THREADS)
+    if (ulThreadCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulThreadCount = MAX_TEST_THREADS;
     }
@@ -1889,7 +1889,7 @@ UINT64 RunContentionTest_MixedWorkload(_In_ int    nSecondsToRun,
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
         return 0;
@@ -1955,21 +1955,21 @@ UINT64 RunContentionTest_ReadHeavySkewed(_In_ int    nSecondsToRun,
 
     TestTable Table;
 
-    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold)))
+    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold))) [[unlikely]]
     {
         return 0;
     }
 
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return 0;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -1983,12 +1983,12 @@ UINT64 RunContentionTest_ReadHeavySkewed(_In_ int    nSecondsToRun,
     Ctx.lWarmUpFlag    = 1;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulThreadCount == 0)
+    if (ulThreadCount == 0) [[unlikely]]
     {
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAX_TEST_THREADS)
+    if (ulThreadCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulThreadCount = MAX_TEST_THREADS;
     }
@@ -1998,7 +1998,7 @@ UINT64 RunContentionTest_ReadHeavySkewed(_In_ int    nSecondsToRun,
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
         return 0;
@@ -2064,21 +2064,21 @@ UINT64 RunContentionTest_ZipfianSkewed(_In_ int    nSecondsToRun,
 
     TestTable Table;
 
-    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold)))
+    if (!NT_SUCCESS(Table.Initialize(uCacheCapacity, u32PromotionThreshold))) [[unlikely]]
     {
         return 0;
     }
 
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return 0;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -2093,12 +2093,12 @@ UINT64 RunContentionTest_ZipfianSkewed(_In_ int    nSecondsToRun,
     Ctx.bZipfian       = TRUE;
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulThreadCount == 0)
+    if (ulThreadCount == 0) [[unlikely]]
     {
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAX_TEST_THREADS)
+    if (ulThreadCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulThreadCount = MAX_TEST_THREADS;
     }
@@ -2108,7 +2108,7 @@ UINT64 RunContentionTest_ZipfianSkewed(_In_ int    nSecondsToRun,
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
         return 0;
@@ -2180,14 +2180,14 @@ BOOLEAN RunTrimPerformanceTest(_In_ SIZE_T uCacheCapacity,
 
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -2219,7 +2219,7 @@ BOOLEAN RunTrimPerformanceTest(_In_ SIZE_T uCacheCapacity,
     UINT64 ullTimePerOpNs = 0;
     UINT64 ullThroughput = 0;
 
-    if (uItemsActuallyTrimmed > 0)
+    if (uItemsActuallyTrimmed > 0) [[likely]]
     {
         ullTimePerOpNs = (ullTicks * 1000000000ULL) / (uItemsActuallyTrimmed * liFreq.QuadPart);
         ullThroughput = (uItemsActuallyTrimmed * liFreq.QuadPart) / ullTicks;
@@ -2254,14 +2254,14 @@ BOOLEAN RunTrimToWatermarkTest(_In_ SIZE_T uCacheCapacity)
 
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -2296,7 +2296,7 @@ BOOLEAN RunTrimToWatermarkTest(_In_ SIZE_T uCacheCapacity)
 
     LOG_INFO("[LRU]      - Total Trim(0) Time   : %llu ms\n", ullElapsedMs);
 
-    if (uItemsActuallyTrimmed > 0)
+    if (uItemsActuallyTrimmed > 0) [[likely]]
     {
         UINT64 ullTimePerOpNs = (ullTicks * 1000000000ULL) / (uItemsActuallyTrimmed * liFreq.QuadPart);
         UINT64 ullThroughput = (uItemsActuallyTrimmed * liFreq.QuadPart) / ullTicks;
@@ -2335,14 +2335,14 @@ BOOLEAN RunForcedTrimTest(_In_ SIZE_T uCacheCapacity)
     // ------------------------------------------------------------------------
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -2368,7 +2368,7 @@ BOOLEAN RunForcedTrimTest(_In_ SIZE_T uCacheCapacity)
     {
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -2418,14 +2418,14 @@ BOOLEAN RunEnumerateTest(_In_ SIZE_T uCacheCapacity)
 
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -2442,7 +2442,7 @@ BOOLEAN RunEnumerateTest(_In_ SIZE_T uCacheCapacity)
     Table.Enumerate([&](const UINT64&      ullKey,
                         RefCountedPayload* pValue) -> BOOLEAN
         {
-            if (pValue)
+            if (pValue) [[likely]]
             {
                 uCount++;
                 ullActualSum += ullKey;
@@ -2506,7 +2506,7 @@ VOID ScalingWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
-    if (ExAcquireRundownProtection(&g_TestRundown))
+    if (ExAcquireRundownProtection(&g_TestRundown)) [[likely]]
     {
         UINT64 ullLocalOps = 0;
         UINT64 ullMaxKey = pScalingCtx->uCacheCapacity + (pScalingCtx->uCacheCapacity / 2);
@@ -2514,7 +2514,7 @@ VOID ScalingWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
         // Warm-up phase
         while (InterlockedCompareExchange(&pScalingCtx->lWarmUpFlag, 0, 0) != 0)
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -2531,7 +2531,7 @@ VOID ScalingWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
         // Timed benchmark phase
         while (!InterlockedCompareExchange(pCtx->plStopFlag, 0, 0))
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -2552,7 +2552,7 @@ VOID ScalingWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
             {
                 RefCountedPayload* pPayload = new RefCountedPayload(ullKey);
 
-                if (pPayload)
+                if (pPayload) [[likely]]
                 {
                     (void)pScalingCtx->pTable->Add(ullKey, pPayload);
                     pPayload->Release();
@@ -2584,12 +2584,12 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
     LOG_INFO("[LRU]      ------------------------------------------\n");
 
     ULONG ulMaxThreads = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulMaxThreads == 0)
+    if (ulMaxThreads == 0) [[unlikely]]
     {
         ulMaxThreads = 4;
     }
 
-    if (ulMaxThreads > MAX_TEST_THREADS)
+    if (ulMaxThreads > MAX_TEST_THREADS) [[unlikely]]
     {
         ulMaxThreads = MAX_TEST_THREADS;
     }
@@ -2609,7 +2609,7 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
             bDidMax = TRUE;
         }
 
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
@@ -2620,14 +2620,14 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
 
         for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
         {
-            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 return FALSE;
             }
 
             RefCountedPayload* pPayload = new RefCountedPayload(uI);
 
-            if (pPayload)
+            if (pPayload) [[likely]]
             {
                 (void)Table.Add(uI, pPayload);
                 pPayload->Release();
@@ -2641,7 +2641,7 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
 
         TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-        if (pMgr == NULL)
+        if (pMgr == NULL) [[unlikely]]
         {
             LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
             return FALSE;
@@ -2684,7 +2684,7 @@ BOOLEAN RunThreadScalingSweep(_In_ SIZE_T uCacheCapacity,
         UINT64 ullScaleWhole = 0;
         UINT64 ullScaleFrac = 0;
 
-        if (ullBaselineThroughput > 0)
+        if (ullBaselineThroughput > 0) [[likely]]
         {
             UINT64 ullScaleFactor = (ullThroughput * 100) / ullBaselineThroughput;
             ullScaleWhole = ullScaleFactor / 100;
@@ -2728,7 +2728,7 @@ VOID TailLatencyWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 
     KeWaitForSingleObject(pCtx->pStartEvent, Executive, KernelMode, FALSE, NULL);
 
-    if (ExAcquireRundownProtection(&g_TestRundown))
+    if (ExAcquireRundownProtection(&g_TestRundown)) [[likely]]
     {
         UINT64  ullMaxKey = pTailLatencyCtx->uCacheCapacity + (pTailLatencyCtx->uCacheCapacity / 2);
         UINT32  u32OpCounter = 0;
@@ -2738,7 +2738,7 @@ VOID TailLatencyWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
         // Warm-up phase
         while (InterlockedCompareExchange(&pTailLatencyCtx->lWarmUpFlag, 0, 0) != 0)
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -2755,7 +2755,7 @@ VOID TailLatencyWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
         // Sampling phase
         while (uSampleIdx < pTailLatencyCtx->uSamplesPerThread)
         {
-            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+            if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
             {
                 break;
             }
@@ -2769,7 +2769,7 @@ VOID TailLatencyWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
             LARGE_INTEGER liT0 = { 0 };
             LARGE_INTEGER liT1 = { 0 };
 
-            if (bShouldSample)
+            if (bShouldSample) [[unlikely]]
             {
                 liT0 = KeQueryPerformanceCounter(NULL);
             }
@@ -2787,14 +2787,14 @@ VOID TailLatencyWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
             {
                 RefCountedPayload* pPayload = new RefCountedPayload(ullKey);
 
-                if (pPayload)
+                if (pPayload) [[likely]]
                 {
                     (void)pTailLatencyCtx->pTable->Add(ullKey, pPayload);
                     pPayload->Release();
                 }
             }
 
-            if (bShouldSample)
+            if (bShouldSample) [[unlikely]]
             {
                 liT1 = KeQueryPerformanceCounter(NULL);
                 UINT64 ullElapsedNs = ((liT1.QuadPart - liT0.QuadPart) * 1000000000ULL) / pTailLatencyCtx->liFreq.QuadPart;
@@ -2824,13 +2824,13 @@ BOOLEAN RunTailLatencyTest(_In_ SIZE_T uCacheCapacity)
 
     for (SIZE_T uI = 0; uI < uCacheCapacity; ++uI)
     {
-        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0))
+        if ((uI % 10000) == 0 && InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]]
         {
             return FALSE;
         }
 
         RefCountedPayload* pPayload = new RefCountedPayload(uI);
-        if (pPayload)
+        if (pPayload) [[likely]]
         {
             (void)Table.Add(uI, pPayload);
             pPayload->Release();
@@ -2838,12 +2838,12 @@ BOOLEAN RunTailLatencyTest(_In_ SIZE_T uCacheCapacity)
     }
 
     ULONG ulThreadCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (ulThreadCount == 0)
+    if (ulThreadCount == 0) [[unlikely]]
     {
         ulThreadCount = 4;
     }
 
-    if (ulThreadCount > MAX_TEST_THREADS)
+    if (ulThreadCount > MAX_TEST_THREADS) [[unlikely]]
     {
         ulThreadCount = MAX_TEST_THREADS;
     }
@@ -2852,7 +2852,7 @@ BOOLEAN RunTailLatencyTest(_In_ SIZE_T uCacheCapacity)
     SIZE_T uTotalSamples = uSamplesPerThread * ulThreadCount;
 
     UINT64* pGlobalSamples = (UINT64*)ExAllocatePool2(POOL_FLAG_PAGED, uTotalSamples * sizeof(UINT64), DRIVER_TAG);
-    if (!pGlobalSamples)
+    if (!pGlobalSamples) [[unlikely]]
     {
         LOG_ERR("[LRU] [!] Failed to allocate latency samples buffer\n");
         return FALSE;
@@ -2868,7 +2868,7 @@ BOOLEAN RunTailLatencyTest(_In_ SIZE_T uCacheCapacity)
 
     TEST_THREAD_MANAGER* pMgr = new (POOL_FLAG_NON_PAGED, DRIVER_TAG) TEST_THREAD_MANAGER();
 
-    if (!pMgr)
+    if (!pMgr) [[unlikely]]
     {
         ExFreePoolWithTag(pGlobalSamples, DRIVER_TAG);
         LOG_ERR("[LRU]      [!] Failed to allocate TEST_THREAD_MANAGER.\n");
@@ -2951,7 +2951,7 @@ VOID RunBenchmarks(_In_opt_ PVOID pContext)
     auto RunAllTests = [&]() -> BOOLEAN
         {
     #define ABORT_CHECK() \
-        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) \
+        if (InterlockedCompareExchange(&g_lAbortTests, 0, 0)) [[unlikely]] \
         { \
             LOG_INFO("[LRU] Abort requested. Stopping test suite execution.\n"); \
             return FALSE; \
@@ -3124,15 +3124,15 @@ VOID RunBenchmarks(_In_opt_ PVOID pContext)
 
     BOOLEAN bTestsPassed = RunAllTests();
 
-    if (g_lLiveObjectsCount != 0)
+    if (g_lLiveObjectsCount != 0) [[unlikely]]
     {
         LOG_ERR("[LRU] [-] MASTER MEMORY LEAK CHECK: %d objects stranded.\n", g_lLiveObjectsCount);
     }
-    else if (!bTestsPassed && InterlockedCompareExchange(&g_lAbortTests, 0, 0) == 0)
+    else if (!bTestsPassed && InterlockedCompareExchange(&g_lAbortTests, 0, 0) == 0) [[unlikely]]
     {
         LOG_ERR("[LRU] [-] Test suite aborted due to an error.\n");
     }
-    else if (!bTestsPassed && InterlockedCompareExchange(&g_lAbortTests, 0, 0) != 0)
+    else if (!bTestsPassed && InterlockedCompareExchange(&g_lAbortTests, 0, 0) != 0) [[unlikely]]
     {
         LOG_INFO("[LRU] [-] Test suite aborted by driver unload.\n");
     }
@@ -3160,7 +3160,7 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT pDriverObject)
     // Block until all threads that took a reference have aborted and released it
     ExWaitForRundownProtectionRelease(&g_TestRundown);
 
-    if (g_pMasterBenchmarkThread != NULL)
+    if (g_pMasterBenchmarkThread != NULL) [[likely]]
     {
         LOG_INFO("[LRU] Waiting for master benchmark thread to terminate...\n");
 
@@ -3176,7 +3176,7 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT pDriverObject)
 
     ExDeletePagedLookasideList(&g_PayloadLookasideList);
 
-    if (g_pLogBuffer)
+    if (g_pLogBuffer) [[likely]]
     {
         ExFreePoolWithTag(g_pLogBuffer, DRIVER_TAG);
         g_pLogBuffer = NULL;
@@ -3199,7 +3199,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT  pDriverObject,
     ExInitializeFastMutex(&g_LogMutex);
 
     g_pLogBuffer = (PCHAR)ExAllocatePool2(POOL_FLAG_PAGED, g_cbLogBufferMax, DRIVER_TAG);    
-    if (g_pLogBuffer)
+    if (g_pLogBuffer) [[likely]]
     {
         g_pLogBuffer[0]     = '\0';
         g_cbLogBufferOffset = 0;
@@ -3228,7 +3228,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT  pDriverObject,
                                              (PKSTART_ROUTINE)RunBenchmarks,
                                              NULL);
 
-    if (NT_SUCCESS(ntStatus))
+    if (NT_SUCCESS(ntStatus)) [[likely]]
     {
         NTSTATUS refStatus = ObReferenceObjectByHandle(hThread,
                                                        THREAD_ALL_ACCESS,
@@ -3237,7 +3237,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT  pDriverObject,
                                                        (PVOID*)&g_pMasterBenchmarkThread,
                                                        NULL);
 
-        if (!NT_SUCCESS(refStatus))
+        if (!NT_SUCCESS(refStatus)) [[unlikely]]
         {
             LOG_ERR("[LRU] [!] Failed to reference master thread handle. Aborting.\n");
             
