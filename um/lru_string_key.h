@@ -33,6 +33,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <cstdint>
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -122,6 +123,24 @@ public:
 
     struct Borrow {};
 
+private:
+    static inline SharedStringBuffer* AllocateHeapBuffer(const char* data, size_t len) noexcept
+    {
+        uint32_t clampedLen = (len > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : static_cast<uint32_t>(len);
+        void* raw = ::operator new(sizeof(SharedStringBuffer) + static_cast<size_t>(clampedLen) + 1, std::nothrow);
+        if (!raw) [[unlikely]]
+        {
+            return nullptr;
+        }
+
+        SharedStringBuffer* buf = std::construct_at(static_cast<SharedStringBuffer*>(raw));
+        buf->Length = clampedLen;
+        std::memcpy(buf->Data, data, clampedLen);
+        buf->Data[clampedLen] = '\0';
+        return buf;
+    }
+
+public:
     // ------------------------------------------------------------------------
     // CONSTRUCTORS
     // ------------------------------------------------------------------------
@@ -145,17 +164,18 @@ public:
         }
         else
         {
+            uint32_t clampedLen = (sv.length() > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : static_cast<uint32_t>(sv.length());
             m_magic      = HEAP_FLAG;
             m_padding    = 0;
             m_hash_cache = static_cast<uint32_t>(Compute32BitHash(sv));
 
-            void* raw = ::operator new(sizeof(SharedStringBuffer) + sv.length() + 1);
+            void* raw = ::operator new(sizeof(SharedStringBuffer) + static_cast<size_t>(clampedLen) + 1);
             
             m_heap_ptr = std::construct_at(static_cast<SharedStringBuffer*>(raw));
 
-            m_heap_ptr->Length = static_cast<uint32_t>(sv.length());
-            std::memcpy(m_heap_ptr->Data, sv.data(), sv.length());
-            m_heap_ptr->Data[sv.length()] = '\0';
+            m_heap_ptr->Length = clampedLen;
+            std::memcpy(m_heap_ptr->Data, sv.data(), clampedLen);
+            m_heap_ptr->Data[clampedLen] = '\0';
         }
     }
 
@@ -192,14 +212,68 @@ public:
         {
             m_heap_ptr->Refs.fetch_add(1, std::memory_order_relaxed);
         }
+        else if (m_state == UNOWNED_FLAG && m_unowned_ptr) [[unlikely]]
+        {
+            // Safety promotion: If a borrowed key is ever copied into a cache node
+            // via Add(), promote it to an owned heap buffer to prevent dangling pointers.
+            SharedStringBuffer* promoted = AllocateHeapBuffer(other.m_unowned_ptr, other.m_unowned_length);
+            if (promoted) [[likely]]
+            {
+                m_magic          = HEAP_FLAG;
+                m_heap_ptr       = promoted;
+                m_unowned_length = 0;
+            }
+        }
+    }
+
+    // Move constructor: zero atomic operations during vector resize or std::shuffle
+    CustomStringKey(CustomStringKey&& other) noexcept
+    {
+        m_blocks[0] = other.m_blocks[0];
+        m_blocks[1] = other.m_blocks[1];
+        m_blocks[2] = other.m_blocks[2];
+
+        other.m_blocks[0] = 0;
+        other.m_blocks[1] = 0;
+        other.m_blocks[2] = 0;
     }
 
     CustomStringKey& operator=(const CustomStringKey& other) noexcept
     {
         if (this != &other) [[likely]]
-        {            
+        {
+            if (m_state == HEAP_FLAG && other.m_state == HEAP_FLAG && m_heap_ptr == other.m_heap_ptr)
+            {
+                return *this;
+            }
+
             std::destroy_at(this);
             std::construct_at(this, other);
+        }
+
+        return *this;
+    }
+
+    CustomStringKey& operator=(CustomStringKey&& other) noexcept
+    {
+        if (this != &other) [[likely]]
+        {
+            if (m_state == HEAP_FLAG && m_heap_ptr)
+            {
+                if (m_heap_ptr->Refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                {
+                    std::destroy_at(m_heap_ptr);
+                    ::operator delete(m_heap_ptr);
+                }
+            }
+
+            m_blocks[0] = other.m_blocks[0];
+            m_blocks[1] = other.m_blocks[1];
+            m_blocks[2] = other.m_blocks[2];
+
+            other.m_blocks[0] = 0;
+            other.m_blocks[1] = 0;
+            other.m_blocks[2] = 0;
         }
 
         return *this;
@@ -243,6 +317,14 @@ public:
             m_blocks[2] == other.m_blocks[2])
         {
             return true;
+        }
+
+        // Since all strings <= 22 chars use zero-padded SSO, any mismatch in m_blocks[0..2]
+        // is guaranteed to be unequal unless BOTH keys are > 22 chars (HEAP or UNOWNED)
+        // and share the exact same 32-bit m_hash_cache.
+        if (m_state < UNOWNED_FLAG || other.m_state < UNOWNED_FLAG || m_hash_cache != other.m_hash_cache) [[likely]]
+        {
+            return false;
         }
 
         // Fallback for logical equality across different memory locations
@@ -299,12 +381,14 @@ struct FastStringHasher
         }
 
         // Fast path for SSO completely resident in registers.
-        uint64_t h = key.m_blocks[0];
+        // Rotate m_blocks[0] right by 16 bits (1-cycle ROR instruction) so that
+        // m_sso_data[0] starts at bit 0, and fold once at the end for full low-bit entropy.
+        uint64_t h = (key.m_blocks[0] >> 16) | (key.m_blocks[0] << 48);
 
         h ^= key.m_blocks[1] + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= key.m_blocks[2] + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
 
-        return h;
+        return h ^ (h >> 32);
     }
 };
 

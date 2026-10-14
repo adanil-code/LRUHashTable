@@ -21,6 +21,7 @@
 #include <mutex>
 #include <vector>
 #include <atomic>
+#include <utility>
 
 #if defined(__linux__)
 #include <time.h>
@@ -107,16 +108,16 @@ constexpr size_t CACHE_LINE_MASK = CACHE_LINE_SIZE - 1;
 // as a memory barrier.
 // ----------------------------------------------------------------------------
 #if defined(_MSC_VER)
-#if defined(_M_ARM64) || defined(_M_ARM)
-#define CPU_PAUSE() __yield()
+#if defined(_M_ARM64)
+#define CPU_PAUSE() __isb(_ARM64_BARRIER_SY)
 #else
 #define CPU_PAUSE() _mm_pause()
 #endif
 #elif defined(__GNUC__) || defined(__clang__)
 #if defined(__i386__) || defined(__x86_64__)
 #define CPU_PAUSE() __builtin_ia32_pause()
-#elif defined(__aarch64__) || defined(__arm__)
-#define CPU_PAUSE() asm volatile("yield" ::: "memory")
+#elif defined(__aarch64__)
+#define CPU_PAUSE() asm volatile("isb" ::: "memory")
 #else
 #define CPU_PAUSE() ((void)0)
 #endif
@@ -413,22 +414,22 @@ struct DefaultNumaAllocator
     }
 
     static inline void* Allocate(_In_ size_t   size,
-        _In_ uint32_t node) noexcept
+                                 _In_ uint32_t node) noexcept
     {
 #if defined(_WIN32)
         void* ptr = VirtualAllocExNuma(GetCurrentProcess(),
-            NULL,
-            size,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE,
-            node);
+                                       NULL,
+                                       size,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_READWRITE,
+                                       node);
         if (!ptr)
         {
             // Fallback to standard VirtualAlloc
             ptr = VirtualAlloc(NULL,
-                size,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE);
+                               size,
+                               MEM_RESERVE | MEM_COMMIT,
+                               PAGE_READWRITE);
         }
 
         return ptr;
@@ -441,6 +442,7 @@ struct DefaultNumaAllocator
                 // Fallback to local NUMA node allocation if the target node is OOM
                 ptr = numa_alloc_local(size);
             }
+
             return ptr;
         }
 
@@ -452,8 +454,8 @@ struct DefaultNumaAllocator
 #endif
     }
 
-    static inline void Free(_In_ void* ptr,
-        _In_ size_t size) noexcept
+    static inline void Free(_In_ void*  ptr,
+                            _In_ size_t size) noexcept
     {
         if (!ptr)
         {
@@ -485,7 +487,7 @@ struct DefaultNumaAllocator
 // Automatically translates to PREFETCHT0 on Intel/AMD and PRFM on ARM.
 // ----------------------------------------------------------------------------
 #if defined(_MSC_VER)
-#if defined(_M_ARM64) || defined(_M_ARM)
+#if defined(_M_ARM64)
 #include <intrin.h>
 #define CACHE_PREFETCH(ptr) __prefetch(ptr)
 #else
@@ -543,10 +545,10 @@ enum class AddAction
 //   atomic reference counting).
 // ----------------------------------------------------------------------------
 template <typename TKey,
-    typename TValue,
-    typename THasher,
-    typename TAllocator      = DefaultNumaAllocator,
-    typename TSpinWaitPolicy = AdaptiveSpinPolicy>
+          typename TValue,
+          typename THasher,
+          typename TAllocator      = DefaultNumaAllocator,
+          typename TSpinWaitPolicy = AdaptiveSpinPolicy>
 class LruHashTable
 {
     // Enforce that TValue destructor is noexcept
@@ -626,6 +628,7 @@ public:
 
         uint32_t                          BucketMask;               // Bitwise mask used to route a hash to a specific bucket index efficiently
         uint32_t                          Capacity;                 // Maximum number of active LruNodes this specific shard can hold
+        void*                             RawShardsBlock;           // Stored in Shard[0] padding to preserve 16-byte LruHashTable footprint
 
         // CACHE LINE 2: Write-Heavy LRU State
         // Mutated on every Add/Overwrite MRU promotion
@@ -728,7 +731,7 @@ private:
                 uint64_t high;
                 uint64_t low = _umul128(hash, kPrime, &high);
                 return low ^ high;
-            #elif defined(_M_ARM64) || defined(_M_ARM64EC)
+            #elif defined(_M_ARM64)
                 uint64_t high = __umulh(hash, kPrime);
                 uint64_t low = hash * kPrime;
                 return low ^ high;
@@ -759,8 +762,8 @@ private:
     // Severs a node from the doubly-linked LRU list using 32-bit indices.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    inline void UnlinkLru(_In_ Shard* ShardPtr,
-        _In_ uint32_t Index) noexcept
+    inline void UnlinkLru(_In_ Shard*   ShardPtr,
+                          _In_ uint32_t Index) noexcept
     {
         uint32_t prev = ShardPtr->Nodes[Index].LruPrev;
         uint32_t next = ShardPtr->Nodes[Index].LruNext;
@@ -790,8 +793,8 @@ private:
     // it as the Most Recently Used item, and updates its Generation stamp.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    inline void PushMru(_In_ Shard* ShardPtr,
-        _In_ uint32_t Index) noexcept
+    inline void PushMru(_In_ Shard*   ShardPtr,
+                        _In_ uint32_t Index) noexcept
     {
         ShardPtr->Generation++;
         ShardPtr->Nodes[Index].LastPromoted = ShardPtr->Generation;
@@ -818,8 +821,8 @@ private:
     // Removes a node from the singly-linked hash collision chain.
     // Caller must hold the shard lock exclusively.
     // ------------------------------------------------------------------------
-    void RemoveFromHashChain(_In_ Shard* ShardPtr,
-        _In_ uint32_t Index) noexcept
+    void RemoveFromHashChain(_In_ Shard*   ShardPtr,
+                             _In_ uint32_t Index) noexcept
     {
         uint32_t bucketIdx = static_cast<uint32_t>(ShardPtr->Nodes[Index].Hash & ShardPtr->BucketMask);
 
@@ -838,6 +841,7 @@ private:
                 {
                     ShardPtr->Nodes[prev].HashNext = ShardPtr->Nodes[curr].HashNext;
                 }
+
                 break;
             }
 
@@ -848,9 +852,40 @@ private:
 
 public:
     LruHashTable() noexcept : m_Shards(nullptr),
-        m_ShardCount(0),
-        m_PromotionThreshold(0)
+                              m_ShardCount(0),
+                              m_PromotionThreshold(0)
     {}
+
+    // Disable copying to prevent shallow-pointer double-free bugs
+    LruHashTable(const LruHashTable&)            = delete;
+    LruHashTable& operator=(const LruHashTable&) = delete;
+
+    // Enable safe move semantics
+    LruHashTable(LruHashTable&& Other) noexcept : m_Shards(Other.m_Shards),
+                                                  m_ShardCount(Other.m_ShardCount),
+                                                  m_PromotionThreshold(Other.m_PromotionThreshold)
+    {
+        Other.m_Shards             = nullptr;
+        Other.m_ShardCount         = 0;
+        Other.m_PromotionThreshold = 0;
+    }
+
+    LruHashTable& operator=(LruHashTable&& Other) noexcept
+    {
+        if (this != &Other)
+        {
+            Cleanup();
+
+            m_Shards             = Other.m_Shards;
+            m_ShardCount         = Other.m_ShardCount;
+            m_PromotionThreshold = Other.m_PromotionThreshold;
+
+            Other.m_Shards             = nullptr;
+            Other.m_ShardCount         = 0;
+            Other.m_PromotionThreshold = 0;
+        }
+        return *this;
+    }
 
     ~LruHashTable() noexcept
     {
@@ -866,7 +901,7 @@ public:
     // ------------------------------------------------------------------------
     [[nodiscard]]
     bool Initialize(_In_ const size_t TotalEntries,
-        _In_ uint32_t     PromotionThreshold = 0) noexcept
+                    _In_ uint32_t     PromotionThreshold = 0) noexcept
     {
         Cleanup();
 
@@ -939,11 +974,37 @@ public:
         // return false without crashing the process
         try
         {
-            // Allocate the Shards block on a first NUMA node
-            m_Shards = static_cast<Shard*>(TAllocator::Allocate(sizeof(Shard) * m_ShardCount, primaryNode));
-            if (!m_Shards) [[unlikely]]
+            // Allocate the Shards block on a first NUMA node.
+            // Check if the allocator already returned CACHE_LINE_SIZE-aligned memory;
+            // only oversize and reallocate if a custom allocator returned an unaligned pointer.
+            size_t shardsAllocSize = sizeof(Shard) * static_cast<size_t>(m_ShardCount);
+            void* rawShardsBlock = TAllocator::Allocate(shardsAllocSize, primaryNode);
+            if (!rawShardsBlock) [[unlikely]]
             {
+                m_ShardCount = 0;
                 return false;
+            }
+
+            if ((reinterpret_cast<uintptr_t>(rawShardsBlock) & CACHE_LINE_MASK) == 0) [[likely]]
+            {
+                m_Shards = static_cast<Shard*>(rawShardsBlock);
+            }
+            else
+            {
+                TAllocator::Free(rawShardsBlock, shardsAllocSize);
+                rawShardsBlock = nullptr;
+
+                shardsAllocSize += CACHE_LINE_SIZE;
+                rawShardsBlock = TAllocator::Allocate(shardsAllocSize, primaryNode);
+                if (!rawShardsBlock) [[unlikely]]
+                {
+                    m_ShardCount = 0;
+                    return false;
+                }
+
+                uintptr_t uShardPtr = reinterpret_cast<uintptr_t>(rawShardsBlock);
+                uShardPtr = (uShardPtr + CACHE_LINE_SIZE) & ~(uintptr_t)CACHE_LINE_MASK;
+                m_Shards  = reinterpret_cast<Shard*>(uShardPtr);
             }
 
             // Explicitly construct the Shards via placement new and zero the 
@@ -953,11 +1014,14 @@ public:
             {
                 new (&m_Shards[i]) Shard();
                 m_Shards[i].RawMemoryBlock = nullptr;
+                m_Shards[i].RawShardsBlock = nullptr;
             }
+
+            m_Shards[0].RawShardsBlock = rawShardsBlock;
 
             // Use ceiling division to prevent capacity loss from truncation
             size_t rawCapacityPerShard = (TotalEntries + m_ShardCount - 1) / m_ShardCount;
-            if (rawCapacityPerShard > UINT32_MAX) [[unlikely]]
+            if (rawCapacityPerShard >= INVALID_INDEX) [[unlikely]]
             {
                 Cleanup();
                 return false; // Cannot support the requested item density per shard
@@ -979,11 +1043,24 @@ public:
                 bucketCountPerShard <<= 1;
             }
 
+            // Guard against 32-bit size_t multiplication and addition overflows
+            if (bucketCountPerShard > (SIZE_MAX - CACHE_LINE_SIZE) / sizeof(uint32_t)) [[unlikely]]
+            {
+                Cleanup();
+                return false;
+            }
+
             // Calculate bucket size and pad it to the nearest dynamic cache boundary for relative alignment
-            size_t bucketBytesPerShard = sizeof(uint32_t) * bucketCountPerShard;
+            size_t bucketBytesPerShard = sizeof(uint32_t) * static_cast<size_t>(bucketCountPerShard);
             bucketBytesPerShard = (bucketBytesPerShard + CACHE_LINE_MASK) & ~(size_t)CACHE_LINE_MASK;
 
-            size_t nodeBytesPerShard = sizeof(LruNode) * capacityPerShard;
+            if (capacityPerShard > (SIZE_MAX - bucketBytesPerShard - CACHE_LINE_SIZE) / sizeof(LruNode)) [[unlikely]]
+            {
+                Cleanup();
+                return false;
+            }
+
+            size_t nodeBytesPerShard = sizeof(LruNode) * static_cast<size_t>(capacityPerShard);
 
             // We allocate Buckets and Nodes in a single block per shard, +CACHE_LINE_SIZE for manual alignment
             size_t allocationSizePerShard = bucketBytesPerShard + nodeBytesPerShard + CACHE_LINE_SIZE;
@@ -1078,7 +1155,11 @@ public:
             return 0;
         }
 
-        size_t totalBytes = sizeof(Shard) * m_ShardCount;
+        size_t totalBytes = sizeof(Shard) * static_cast<size_t>(m_ShardCount);
+        if (m_Shards[0].RawShardsBlock != m_Shards) [[unlikely]]
+        {
+            totalBytes += CACHE_LINE_SIZE;
+        }
 
         for (uint32_t i = 0; i < m_ShardCount; ++i)
         {
@@ -1130,6 +1211,13 @@ public:
     {
         if (m_Shards)
         {
+            void* rawShardsBlock = m_Shards[0].RawShardsBlock;
+            size_t shardsAllocSize = sizeof(Shard) * static_cast<size_t>(m_ShardCount);
+            if (rawShardsBlock != m_Shards) [[unlikely]]
+            {
+                shardsAllocSize += CACHE_LINE_SIZE;
+            }
+
             for (uint32_t i = 0; i < m_ShardCount; ++i)
             {
                 if (m_Shards[i].RawMemoryBlock)
@@ -1164,11 +1252,11 @@ public:
                     TAllocator::Free(m_Shards[i].RawMemoryBlock, m_Shards[i].AllocationSize);
                 }
 
-                // Explicitly destruct the Shard to clean up std::shared_mutex and std::atomic
+                // Explicitly destruct the Shard to clean up SpinLock and std::atomic
                 m_Shards[i].~Shard();
             }
 
-            TAllocator::Free(m_Shards, sizeof(Shard) * m_ShardCount);
+            TAllocator::Free(rawShardsBlock, shardsAllocSize);
             m_Shards = nullptr;
         }
 
@@ -1207,6 +1295,10 @@ public:
     {
         if (!m_Shards || InValue == nullptr) [[unlikely]]
         {
+            if (OutExistingValue != nullptr) [[unlikely]]
+            {
+                *OutExistingValue = nullptr;
+            }
             return false;
         }
 
@@ -1391,6 +1483,11 @@ public:
 
             PushMru(shard, targetIdx);
 
+            if (OutExistingValue != nullptr) [[unlikely]]
+            {
+                *OutExistingValue = nullptr;
+            }
+
             return true;
         }
     }
@@ -1424,6 +1521,7 @@ public:
     {
         if (!m_Shards) [[unlikely]]
         {
+            OutValue = nullptr;
             return false;
         }
 
@@ -1476,6 +1574,7 @@ public:
             curr = next;
         }
 
+        OutValue = nullptr;
         return false;
     }
 
@@ -1590,8 +1689,8 @@ public:
             // High Watermark (90%): The threshold where background trimming activates.
             // Low Watermark (85%): The target threshold we trim down to.
             // This 5% gap prevents "trim thrashing" (constantly trimming 1 item at 90%).
-            size_t highWatermark = (shard->Capacity * 90) / 100;
-            size_t lowWatermark  = (shard->Capacity * 85) / 100;
+            size_t highWatermark = (static_cast<size_t>(shard->Capacity) * 90) / 100;
+            size_t lowWatermark  = (static_cast<size_t>(shard->Capacity) * 85) / 100;
 
             if (!Force)
             {
@@ -1715,7 +1814,7 @@ public:
                 }
 
                 // The callback should return false to abort the enumeration early
-                if (!Callback(shard->Nodes[curr].Key, shard->Nodes[curr].Value))
+                if (!Callback(std::as_const(shard->Nodes[curr].Key), shard->Nodes[curr].Value))
                 {
                     // lockGuard automatically unlocks as we return
                     return;

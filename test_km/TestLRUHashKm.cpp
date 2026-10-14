@@ -37,6 +37,9 @@
 #ifndef POOL_FLAG_UNINITIALIZED
 #define POOL_FLAG_UNINITIALIZED 0x0000000000000002UI64
 #endif
+#ifndef POOL_FLAG_CACHE_ALIGNED
+#define POOL_FLAG_CACHE_ALIGNED 0x0000000000000004UI64
+#endif
 #ifndef ALL_PROCESSOR_GROUPS
 #define ALL_PROCESSOR_GROUPS 0xFFFF
 #endif
@@ -350,9 +353,17 @@ __forceinline BOOLEAN ExTryAcquirePushLockExclusive(_Inout_ EX_PUSH_LOCK* Lock)
     return FALSE;
 }
 
+typedef unsigned char KIRQL;
+
+inline KIRQL KeGetCurrentIrql() noexcept
+{
+    return PASSIVE_LEVEL;
+}
+
 __forceinline void KeEnterCriticalRegion() {}
 
 __forceinline void KeLeaveCriticalRegion() {}
+
 
 #include <windows.h>
 #include <intrin.h>

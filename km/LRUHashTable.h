@@ -18,6 +18,7 @@
 #include <xmmintrin.h>
 #define CACHE_PREFETCH(ptr) _mm_prefetch(reinterpret_cast<const char*>(ptr), _MM_HINT_T0)
 #elif defined(_M_ARM64)
+#include <intrin.h>
 #define CACHE_PREFETCH(ptr) __prefetch(ptr)
 #else
 #define CACHE_PREFETCH(ptr) ((void)0)
@@ -43,12 +44,20 @@ inline void* __cdecl operator new(SIZE_T Size,
 }
 
 inline void __cdecl operator delete(void* Object,
-                                    void* Memory)
+                                    void* Memory) noexcept
 {
     UNREFERENCED_PARAMETER(Object);
     UNREFERENCED_PARAMETER(Memory);
 }
 #endif // KM_PLACEMENT_NEW
+
+#ifndef YieldProcessor
+#if defined(_M_ARM64)
+#define YieldProcessor() __yield()
+#else
+#define YieldProcessor() _mm_pause()
+#endif
+#endif // YieldProcessor
 
 #else
 // Pull in standard placement new for user-mode tests
@@ -103,6 +112,21 @@ enum class AddAction
 template <typename TKey, typename TValue, typename THasher>
 class CLruHashTable
 {
+    // Enforce that TKey copy constructor and destructor are noexcept
+    static_assert(__is_nothrow_constructible(TKey, const TKey&),
+        "TKey must be completely noexcept copy constructible to prevent node leaks during Add()");
+
+    static_assert(__is_nothrow_destructible(TKey),
+        "TKey must be completely noexcept destructible to prevent node leaks during Add()");
+
+    // Enforce that AddRef is strictly noexcept
+    static_assert(noexcept(static_cast<TValue*>(nullptr)->AddRef()),
+        "TValue::AddRef() MUST be declared noexcept to prevent state corruption during cache overwrites");
+
+    // Enforce that Release is strictly noexcept
+    static_assert(noexcept(static_cast<TValue*>(nullptr)->Release()),
+        "TValue::Release() MUST be declared noexcept to prevent permanent capacity leaks during node eviction");
+
 public:
     static const ULONG  POOL_TAG      = 'LruR';
     static const UINT32 INVALID_INDEX = 0xFFFFFFFF;
@@ -164,6 +188,7 @@ public:
 
         UINT32               ulBucketMask;         // Bitwise mask used to route a hash to a specific bucket index efficiently
         UINT32               ulCapacity;           // Maximum number of active LruNodes this specific shard can hold        
+        PVOID                pRawShardsBlock;      // Stored in Shard[0] padding to preserve 16-byte CLruHashTable footprint
 
         // CACHE LINE 2: Write-Heavy LRU State
         // Mutated on every Add/Overwrite MRU promotion
@@ -180,7 +205,7 @@ public:
     };
 
 private:
-    Shard* m_pShards;               // Dynamically allocated array representing the sharded cache architecture
+    Shard* m_pShards;               // 64-byte aligned array representing the sharded cache architecture
     ULONG  m_ulShardCount;          // Total number of initialized shards. Guaranteed to be a power of 2
     UINT32 m_ulPromotionThreshold;  // Percentage threshold (0-100) determining how aggressively nodes are promoted to MRU
 
@@ -324,6 +349,42 @@ public:
         PAGED_CODE();
     }
 
+    // Disable copying to prevent shallow-pointer double-free BugChecks
+    CLruHashTable(const CLruHashTable&)            = delete;
+    CLruHashTable& operator=(const CLruHashTable&) = delete;
+
+    // Enable safe move semantics
+    CLruHashTable(CLruHashTable&& Other) noexcept : m_pShards(Other.m_pShards),
+                                                    m_ulShardCount(Other.m_ulShardCount),
+                                                    m_ulPromotionThreshold(Other.m_ulPromotionThreshold)
+    {
+        PAGED_CODE();
+
+        Other.m_pShards              = NULL;
+        Other.m_ulShardCount         = 0;
+        Other.m_ulPromotionThreshold = 0;
+    }
+
+    CLruHashTable& operator=(CLruHashTable&& Other) noexcept
+    {
+        PAGED_CODE();
+
+        if (this != &Other)
+        {
+            Cleanup();
+
+            m_pShards              = Other.m_pShards;
+            m_ulShardCount         = Other.m_ulShardCount;
+            m_ulPromotionThreshold = Other.m_ulPromotionThreshold;
+
+            Other.m_pShards              = NULL;
+            Other.m_ulShardCount         = 0;
+            Other.m_ulPromotionThreshold = 0;
+        }
+
+        return *this;
+    }
+
     ~CLruHashTable() noexcept
     {
         PAGED_CODE();
@@ -363,6 +424,10 @@ public:
         m_ulPromotionThreshold = ulPromotionThreshold;
 
         ULONG ulNumProcs = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        if (ulNumProcs == 0) [[unlikely]]
+        {
+            ulNumProcs = 1;
+        }
 
         // Aggressive dispersion for massive core counts
         ULONG ulTargetShards = ulNumProcs * 32;
@@ -408,28 +473,41 @@ public:
         // Prevent unrealistic capacity requests
         if ((uTotalEntries / m_ulShardCount) >= (INVALID_INDEX - 1)) [[unlikely]]
         {
+            m_ulShardCount = 0;
             return STATUS_INVALID_PARAMETER;
         }
 
         // Non-Paged Pool Allocation with NUMA.
         // The contiguous Shard array is pinned in physical RAM. Because it
         // is a single array, we bind the entire block to the local NUMA node.
+        // Over-allocate by 64 bytes and shift to guarantee strict 64-byte cache-line
+        // alignment even when the OS pool returns 16-byte aligned sub-page blocks.
         POOL_EXTENDED_PARAMETER shardExtParams = { 0 };
 
         shardExtParams.Type          = PoolExtendedParameterNumaNode;
         shardExtParams.Optional      = 1;
         shardExtParams.PreferredNode = KeGetCurrentNodeNumber();
 
-        m_pShards = static_cast<Shard*>(ExAllocatePool3(POOL_FLAG_NON_PAGED,
-                                                        sizeof(Shard) * m_ulShardCount,
-                                                        POOL_TAG,
-                                                        &shardExtParams,
-                                                        1));
-        if (!m_pShards) [[unlikely]]
+        SIZE_T uShardsAllocSize = (sizeof(Shard) * static_cast<SIZE_T>(m_ulShardCount)) + 64;
+
+        PVOID pRawShardsBlock = ExAllocatePool3(POOL_FLAG_NON_PAGED,
+                                                uShardsAllocSize,
+                                                POOL_TAG,
+                                                &shardExtParams,
+                                                1);
+        if (!pRawShardsBlock) [[unlikely]]
         {
+            m_ulShardCount = 0;
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-                
+
+        // Shift the raw Shard array pointer to the next absolute 64-byte boundary
+        UINT_PTR uShardPtr = reinterpret_cast<UINT_PTR>(pRawShardsBlock);
+        uShardPtr = (uShardPtr + 63) & ~(UINT_PTR)63;
+        m_pShards = reinterpret_cast<Shard*>(uShardPtr);
+
+        m_pShards[0].pRawShardsBlock = pRawShardsBlock;
+
         SIZE_T uRawCapacityPerShard = (uTotalEntries + m_ulShardCount - 1) / m_ulShardCount;
 
         // Must be strictly less than INVALID_INDEX (0xFFFFFFFF) because 
@@ -439,6 +517,7 @@ public:
             Cleanup();
             return STATUS_INVALID_PARAMETER;
         }
+
         UINT32 ulCapacityPerShard = static_cast<UINT32>(uRawCapacityPerShard);
 
         // Absolute floor to prevent zero-capacity configuration bugs on microscopic tables
@@ -455,10 +534,16 @@ public:
         }
 
         // Calculate bucket size and pad it to the nearest 64 bytes for relative alignment
-        SIZE_T uBucketBytesPerShard = sizeof(UINT32) * ulBucketCountPerShard;
+        SIZE_T uBucketBytesPerShard = sizeof(UINT32) * static_cast<SIZE_T>(ulBucketCountPerShard);
         uBucketBytesPerShard = (uBucketBytesPerShard + 63) & ~(SIZE_T)63;
 
-        SIZE_T uNodeBytesPerShard = sizeof(LruNode) * ulCapacityPerShard;
+        if (ulCapacityPerShard > (~(SIZE_T)0 - uBucketBytesPerShard - 64) / sizeof(LruNode)) [[unlikely]]
+        {
+            Cleanup();
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        SIZE_T uNodeBytesPerShard = sizeof(LruNode) * static_cast<SIZE_T>(ulCapacityPerShard);
 
         // Over-allocate by 64 bytes to allow for manual absolute alignment
         SIZE_T uAllocationSizePerShard = uBucketBytesPerShard + uNodeBytesPerShard + 64;
@@ -487,7 +572,7 @@ public:
         USHORT usHighestNode = KeQueryHighestNodeNumber();
         ULONG ulMaxNodes     = usHighestNode + 1;
 
-        USHORT* pusActiveNodes = static_cast<USHORT*>(ExAllocatePool2(POOL_FLAG_PAGED,
+        USHORT* pusActiveNodes = static_cast<USHORT*>(ExAllocatePool2(POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED,
                                                                       ulMaxNodes * sizeof(USHORT),
                                                                       POOL_TAG));
         ULONG ulActiveNodeCount = 0;
@@ -507,8 +592,10 @@ public:
             }
         }
 
+        BOOLEAN bHasPopulatedActiveNodes = (ulActiveNodeCount > 0);
+
         // If allocation failed or OS returned 0 active nodes
-        if (ulActiveNodeCount == 0) [[unlikely]]
+        if (!bHasPopulatedActiveNodes) [[unlikely]]
         {
             ulActiveNodeCount = ulMaxNodes;
         }
@@ -519,7 +606,7 @@ public:
             USHORT usTargetNode;
 
             // Route the shard using our compacted list of truly active nodes
-            if (pusActiveNodes && pusActiveNodes[ulIdx % ulActiveNodeCount] <= usHighestNode) [[likely]]
+            if (bHasPopulatedActiveNodes && pusActiveNodes && pusActiveNodes[ulIdx % ulActiveNodeCount] <= usHighestNode) [[likely]]
             {
                 usTargetNode = pusActiveNodes[ulIdx % ulActiveNodeCount];
             }
@@ -534,7 +621,7 @@ public:
             extendedParams.Optional      = 1;
             extendedParams.PreferredNode = usTargetNode;
 
-            PVOID pRawBlock = ExAllocatePool3(POOL_FLAG_NON_PAGED,
+            PVOID pRawBlock = ExAllocatePool3(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED,
                                               uAllocationSizePerShard,
                                               POOL_TAG,
                                               &extendedParams,
@@ -558,7 +645,7 @@ public:
             uPtr = (uPtr + 63) & ~(UINT_PTR)63;
 
             m_pShards[ulIdx].pulBuckets = reinterpret_cast<UINT32*>(uPtr);
-            m_pShards[ulIdx].pNodes = reinterpret_cast<LruNode*>(uPtr + uBucketBytesPerShard);
+            m_pShards[ulIdx].pNodes     = reinterpret_cast<LruNode*>(uPtr + uBucketBytesPerShard);
 
             // Initialize all buckets to INVALID_INDEX (empty)
             RtlFillMemory(m_pShards[ulIdx].pulBuckets,
@@ -610,7 +697,7 @@ public:
             return 0;
         }
 
-        SIZE_T uTotalBytes = sizeof(Shard) * m_ulShardCount;
+        SIZE_T uTotalBytes = (sizeof(Shard) * static_cast<SIZE_T>(m_ulShardCount)) + 64;
 
         for (ULONG ulIdx = 0; ulIdx < m_ulShardCount; ++ulIdx)
         {
@@ -665,6 +752,8 @@ public:
 
         if (m_pShards) [[likely]]
         {
+            PVOID pRawShardsBlock = m_pShards[0].pRawShardsBlock;
+
             for (ULONG ulIdx = 0; ulIdx < m_ulShardCount; ++ulIdx)
             {
                 if (m_pShards[ulIdx].pRawMemoryBlock) [[likely]]
@@ -698,8 +787,11 @@ public:
                 }
             }
 
-            ExFreePoolWithTag(m_pShards,
-                              POOL_TAG);
+            if (pRawShardsBlock) [[likely]]
+            {
+                ExFreePoolWithTag(pRawShardsBlock,
+                                  POOL_TAG);
+            }
 
             m_pShards = NULL;
         }
@@ -741,6 +833,10 @@ public:
 
         if (pInValue == NULL || !m_pShards) [[unlikely]]
         {
+            if (ppOutExistingValue != NULL) [[unlikely]]
+            {
+                *ppOutExistingValue = NULL;
+            }
             return FALSE;
         }
 
@@ -850,14 +946,14 @@ public:
                 ulTargetIdx   = ulReservedIdx;
                 ulReservedIdx = INVALID_INDEX;
                 
-                pShard->ulActiveCount++;
+                pShard->ulActiveCount = pShard->ulActiveCount + 1;
             }
             else if (pShard->ulFreeHead != INVALID_INDEX)
             {
                 // Fast Path B: Cache has unused capacity. Pop from the Free List.
                 ulTargetIdx        = pShard->ulFreeHead;
                 pShard->ulFreeHead = pShard->pNodes[ulTargetIdx].ulHashNext;
-                
+
                 // Drop the pushlock completely before executing the TKey copy constructor
                 ExReleasePushLockExclusive(&pShard->lockPush);
                 KeLeaveCriticalRegion();
@@ -880,10 +976,18 @@ public:
                     ExReleasePushLockExclusive(&pShard->lockPush);
                     KeLeaveCriticalRegion();
 
-                    // Yield to the OS scheduler to let preempted threads finish Release()
-                    LARGE_INTEGER yieldTimeout;
-                    yieldTimeout.QuadPart = -10000; // 1 millisecond relative delay
-                    KeDelayExecutionThread(KernelMode, FALSE, &yieldTimeout);
+                    if (KeGetCurrentIrql() == PASSIVE_LEVEL)
+                    {
+                        // Yield to the OS scheduler to let preempted threads finish Release()
+                        LARGE_INTEGER yieldTimeout;
+                        yieldTimeout.QuadPart = -10000; // 1 millisecond relative delay
+                        KeDelayExecutionThread(KernelMode, FALSE, &yieldTimeout);
+                    }
+                    else
+                    {
+                        // At APC_LEVEL, blocking via KeDelayExecutionThread is not permitted
+                        YieldProcessor();
+                    }
 
                     continue;
                 }
@@ -895,7 +999,7 @@ public:
 
                 // Clear Value first to hide this node from concurrent Lookups
                 pShard->pNodes[ulTargetIdx].pValue = NULL;                
-                pShard->ulActiveCount--;
+                pShard->ulActiveCount = pShard->ulActiveCount - 1;
 
                 ExReleasePushLockExclusive(&pShard->lockPush);
                 KeLeaveCriticalRegion();
@@ -939,6 +1043,11 @@ public:
             ExReleasePushLockExclusive(&pShard->lockPush);
             KeLeaveCriticalRegion();
 
+            if (ppOutExistingValue != NULL) [[unlikely]]
+            {
+                *ppOutExistingValue = NULL;
+            }
+
             return TRUE;
         }
     }
@@ -972,10 +1081,9 @@ public:
     {
         PAGED_CODE();
 
-        pOutValue = NULL;
-
         if (!m_pShards) [[unlikely]]
         {
+            pOutValue = NULL;
             return FALSE;
         }
 
@@ -1034,6 +1142,7 @@ public:
         ExReleasePushLockExclusive(&pShard->lockPush);
         KeLeaveCriticalRegion();
 
+        pOutValue = NULL;
         return FALSE;
     }
 
@@ -1083,7 +1192,7 @@ public:
                 TValue* pValueToRelease = pShard->pNodes[ulCurr].pValue;
 
                 pShard->pNodes[ulCurr].pValue = NULL;
-                pShard->ulActiveCount--;
+                pShard->ulActiveCount = pShard->ulActiveCount - 1;
 
                 ExReleasePushLockExclusive(&pShard->lockPush);
                 KeLeaveCriticalRegion();
@@ -1155,8 +1264,8 @@ public:
             // High Watermark (90%): The threshold where background trimming activates.
             // Low Watermark (85%): The target threshold we trim down to.
             // This 5% gap prevents "trim thrashing" (constantly trimming 1 item at 90%).
-            SIZE_T uHighWatermark = (pShard->ulCapacity * 90) / 100;
-            SIZE_T uLowWatermark  = (pShard->ulCapacity * 85) / 100;
+            SIZE_T uHighWatermark = (static_cast<SIZE_T>(pShard->ulCapacity) * 90) / 100;
+            SIZE_T uLowWatermark  = (static_cast<SIZE_T>(pShard->ulCapacity) * 85) / 100;
 
             if (!bForce) [[likely]]
             {
@@ -1197,7 +1306,7 @@ public:
                         TValue* pValueToRelease = pShard->pNodes[ulTargetIdx].pValue;
 
                         pShard->pNodes[ulTargetIdx].pValue = NULL;                        
-                        pShard->ulActiveCount--;
+                        pShard->ulActiveCount = pShard->ulActiveCount - 1;
 
                         ExReleasePushLockExclusive(&pShard->lockPush);
                         KeLeaveCriticalRegion();
@@ -1263,7 +1372,7 @@ public:
     // where no concurrent threads are accessing the cache.
     // ------------------------------------------------------------------------    
     template <typename TCallback>
-    VOID Enumerate(_In_ const TCallback& __restrict Callback) noexcept
+    VOID Enumerate(_In_ const TCallback& __restrict Callback) const noexcept
     {
         PAGED_CODE();
 
@@ -1293,7 +1402,7 @@ public:
                 }
 
                 // The callback should return FALSE to abort the enumeration early
-                if (!Callback(pShard->pNodes[ulCurr].tKey, pShard->pNodes[ulCurr].pValue)) [[unlikely]]
+                if (!Callback(static_cast<const TKey&>(pShard->pNodes[ulCurr].tKey), pShard->pNodes[ulCurr].pValue)) [[unlikely]]
                 {
                     ExReleasePushLockExclusive(&pShard->lockPush);
                     KeLeaveCriticalRegion();
