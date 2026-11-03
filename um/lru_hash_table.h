@@ -351,39 +351,58 @@ public:
 // ----------------------------------------------------------------------------
 struct DefaultNumaAllocator
 {
+private:
+#if defined(__linux__)
+    // Cache NUMA availability once in a thread-safe static variable.
+    // In libnuma, numa_available() is not cached internally and executes a 
+    // raw get_mempolicy() syscall on every invocation. Caching this avoids 
+    // thousands of redundant syscalls during shard initialization/cleanup, 
+    // verifies that libnuma's constructor has initialized numa_all_nodes_ptr,
+    // and guarantees Allocate() and Free() never disagree if process privileges 
+    // or seccomp filters change after initialization.
+    static inline bool IsNumaAvailable() noexcept
+    {
+        static const bool isAvailable = (numa_available() >= 0) &&
+                                        (numa_all_nodes_ptr != nullptr);
+        return isAvailable;
+    }
+#endif
+
+public:
     // Returns a const reference to avoid all heap allocations and copies
     static const std::vector<uint32_t>& GetValidNodes() noexcept
     {
         // Use static variable to be initialized exactly ONCE in a thread-safe manner
-        static const std::vector<uint32_t> validNodes = []()
+        static const std::vector<uint32_t> validNodes = []() noexcept -> std::vector<uint32_t>
             {
+                std::vector<uint32_t> nodes;
+
                 try
                 {
-                    std::vector<uint32_t> nodes;
-
 #if defined(_WIN32)
                     ULONG highestNode = 0;
                     if (GetNumaHighestNodeNumber(&highestNode))
                     {
-                        const USHORT maxNode = static_cast<USHORT>(highestNode);
-                        for (USHORT i = 0; i <= maxNode; ++i)
+                        const ULONG maxNode = (highestNode < 0xFFFFUL) ? highestNode : 0xFFFFUL;
+                        for (ULONG i = 0; i <= maxNode; ++i)
                         {
                             ULONGLONG availableMemory = 0;
-                            if (GetNumaAvailableMemoryNodeEx(i, &availableMemory))
+                            if (GetNumaAvailableMemoryNodeEx(static_cast<USHORT>(i), &availableMemory) &&
+                                availableMemory > 0)
                             {
-                                nodes.push_back(i);
+                                nodes.push_back(static_cast<uint32_t>(i));
                             }
                         }
                     }
 #elif defined(__linux__)
-                    if (numa_available() >= 0)
+                    if (IsNumaAvailable())
                     {
                         int highestNode = numa_max_node();
                         for (int i = 0; i <= highestNode; ++i)
                         {
-                            if (numa_bitmask_isbitset(numa_all_nodes_ptr, i))
+                            if (numa_bitmask_isbitset(numa_all_nodes_ptr, static_cast<unsigned int>(i)))
                             {
-                                nodes.push_back(i);
+                                nodes.push_back(static_cast<uint32_t>(i));
                             }
                         }
                     }
@@ -394,19 +413,29 @@ struct DefaultNumaAllocator
                         nodes.push_back(0);
                     }
 
-                    // Shrink to fit to minimize memory footprint of the cached vector
+                    // Shrink to fit to minimize memory footprint of the cached vector.
+                    // If shrink_to_fit() throws std::bad_alloc under memory pressure,
+                    // the catch block below preserves all nodes already discovered in 'nodes'.
                     nodes.shrink_to_fit();
                     return nodes;
                 }
                 catch (const std::bad_alloc&)
                 {
-                    // Absolute fallback if vector heap allocation fails.
-                    // We return a vector with just Node 0. 
+                    // If 'nodes' already captured at least one valid node before a subsequent
+                    // vector growth or shrink_to_fit() failed, return the already-populated 
+                    // vector without performing any further heap allocations.
+                    if (!nodes.empty())
+                    {
+                        return nodes;
+                    }
+
+                    // Absolute fallback if the very first vector heap allocation fails.
+                    // We return a vector with just Node 0 constructed directly in the return 
+                    // slot via copy elision to avoid a duplicate static copy allocation.
                     // Note: Returning {0} technically requires a small allocation, 
                     // but if the system cannot fulfill a 4-byte allocation at this 
                     // stage, process termination due to out of memory is imminent anyway.
-                    static const std::vector<uint32_t> fallback{ 0 };
-                    return fallback;
+                    return std::vector<uint32_t>{ 0 };
                 }
             }();
 
@@ -416,6 +445,11 @@ struct DefaultNumaAllocator
     static inline void* Allocate(_In_ size_t   size,
                                  _In_ uint32_t node) noexcept
     {
+        if (size == 0) [[unlikely]]
+        {
+            return nullptr;
+        }
+
 #if defined(_WIN32)
         void* ptr = VirtualAllocExNuma(GetCurrentProcess(),
                                        NULL,
@@ -434,12 +468,14 @@ struct DefaultNumaAllocator
 
         return ptr;
 #elif defined(__linux__)
-        if (numa_available() >= 0)
+        if (IsNumaAvailable())
         {
-            void* ptr = numa_alloc_onnode(size, node);
+            void* ptr = numa_alloc_onnode(size, static_cast<int>(node));
             if (!ptr)
             {
-                // Fallback to local NUMA node allocation if the target node is OOM
+                // Fallback to local NUMA node allocation if target node allocation fails.
+                // Note: libnuma uses lazy mmap() + mbind(), so physical page allocation 
+                // occurs when the caller faults the pages in.
                 ptr = numa_alloc_local(size);
             }
 
@@ -450,6 +486,7 @@ struct DefaultNumaAllocator
         return ::operator new[](size, std::align_val_t{ CACHE_LINE_SIZE }, std::nothrow);
 #else
         // macOS / Unsupported platforms
+        (void)node;
         return ::operator new[](size, std::align_val_t{ CACHE_LINE_SIZE }, std::nothrow);
 #endif
     }
@@ -457,18 +494,21 @@ struct DefaultNumaAllocator
     static inline void Free(_In_ void*  ptr,
                             _In_ size_t size) noexcept
     {
-        if (!ptr)
+        if (!ptr || size == 0) [[unlikely]]
         {
             return;
         }
 
 #if defined(_WIN32)
+        (void)size;
+
         // Size must be 0 when using MEM_RELEASE
         VirtualFree(ptr, 0, MEM_RELEASE);
 #elif defined(__linux__)
-        if (numa_available() >= 0)
+        if (IsNumaAvailable())
         {
             // Since we only used numa_alloc_* in the Allocate block, 
+            // and IsNumaAvailable() is cached for the lifetime of the process,
             // this is 100% safe.
             numa_free(ptr, size);
         }
@@ -477,6 +517,7 @@ struct DefaultNumaAllocator
             ::operator delete[](ptr, std::align_val_t{ CACHE_LINE_SIZE });
         }
 #else
+        (void)size;
         ::operator delete[](ptr, std::align_val_t{ CACHE_LINE_SIZE });
 #endif
     }
